@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Secrets — NEVER commit real env files (tokens, service keys, ENCRYPTION_KEY)
+.env
+.env.*
+!.env.example
+
+# Logs / OS noise
+*.log
+.DS_Store
+Thumbs.db
