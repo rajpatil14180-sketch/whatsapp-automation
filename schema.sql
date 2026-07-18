@@ -131,6 +131,18 @@ create table if not exists system_events (
 
 create index if not exists system_events_created_idx on system_events (created_at desc);
 
+-- ============================================================
+-- MIGRATION 002 — conversation entry mode.
+-- Append-only: safe to run on an existing database.
+-- ============================================================
+
+-- Who sent the FIRST message of this conversation:
+--   'us'      = we reached out (lead-form / outbound) — the AI leads.
+--   'student' = they messaged first (inbound / Click-to-WhatsApp) — the AI
+--               responds human-first and lets qualification emerge.
+-- Default 'us' so existing rows keep their current behavior.
+alter table leads add column if not exists initiated_by text not null default 'us';
+
 -- ------------------------------------------------------------
 -- Example: register your first client. Fill in the real values.
 -- ------------------------------------------------------------

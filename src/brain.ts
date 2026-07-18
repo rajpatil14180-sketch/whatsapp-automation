@@ -81,7 +81,17 @@ function resolveConfig(tenant: Tenant): QualifyingConfig {
   return { ...DEFAULT_STUDY_ABROAD_CONFIG, ...custom };
 }
 
-function systemPrompt(tenant: Tenant): string {
+// OPENING POSTURE (entry mode) — fixed and vertical-independent, so it is NOT
+// part of QualifyingConfig. The judgment model is identical either way; only
+// who is leading the conversation at the start changes.
+const POSTURE_US = `OPENING POSTURE — YOU REACHED OUT FIRST:
+This lead submitted an enquiry and you contacted them. You are naturally leading the conversation. Open warmly and guide it, over the next few messages, toward understanding their plans — following the judgment rules below. Do not rush or interrogate; let it feel like a friendly conversation.`;
+
+const POSTURE_STUDENT = `OPENING POSTURE — THE STUDENT MESSAGED YOU FIRST:
+This person contacted YOU — possibly with just a greeting ("hi", "hello"), something vague, or a random question ("fees?", "Italy??"). Do NOT jump straight into qualifying questions — that feels robotic and cold. Respond FIRST as a warm, genuinely curious human: engage with whatever they actually said, the way a friendly counsellor would. You do NOT need to qualify them immediately or all at once. Let the things you care about surface NATURALLY over the course of the conversation — through real, flowing chat — not in your first message.
+If they ask a specific question, answer it lightly and honestly (always respecting the SAFETY RULES — you cannot quote fees, amounts, or promise outcomes), then gently steer back toward their plans. You keep a light hand on the wheel: never let the conversation drift into a pure Q&A help-desk where you never learn anything, but never march through a checklist or fire questions in sequence either. If they clearly just want information first, give it warmly, then try again a little later. Warm and human first; qualification emerges from the conversation, it is not done *to* them.`;
+
+function systemPrompt(tenant: Tenant, initiatedBy: 'us' | 'student'): string {
   const cfg = resolveConfig(tenant);
   const fieldNames = cfg.fields_to_extract.map((f) => f.split(':')[0].trim());
   const extractedSchema = cfg.extracted_schema?.trim()
@@ -100,6 +110,8 @@ function systemPrompt(tenant: Tenant): string {
 YOU HAVE TWO JOBS ON EVERY MESSAGE:
 1. Write the next WhatsApp reply to the lead. Warm, human, SHORT (1-3 sentences). One question at a time — never interrogate, never send a wall of text. Match the lead's language and register (English or Hinglish). Your aim is to keep them talking and move them toward booking a call with a counsellor.
 2. Silently qualify the lead and return structured data.
+
+${initiatedBy === 'student' ? POSTURE_STUDENT : POSTURE_US}
 ${persona}
 WHAT TO LEARN (naturally, across the conversation — do NOT ask everything at once):
 ${cfg.fields_to_extract.map((f) => `- ${f}`).join('\n')}
@@ -161,7 +173,8 @@ Analyse and respond with the JSON object only.`;
     const res = await client.messages.create({
       model: config.anthropicModel,
       max_tokens: 1024,
-      system: systemPrompt(tenant),
+      // Old rows from before migration 002 can lack the column at runtime → default 'us'.
+      system: systemPrompt(tenant, lead.initiated_by ?? 'us'),
       messages: [{ role: 'user', content: user }],
     });
     const block = res.content.find((b) => b.type === 'text');

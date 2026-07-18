@@ -61,10 +61,16 @@ export async function getLeadById(id: string): Promise<Lead | null> {
   return data as Lead | null;
 }
 
-export async function createLead(tenantId: string, n: NormalizedLead): Promise<Lead | null> {
+// `initiatedBy` records who sent the first message ('us' = we reached out,
+// 'student' = they messaged first). Fixed at creation — attachToLead never touches it.
+export async function createLead(
+  tenantId: string,
+  n: NormalizedLead,
+  initiatedBy: 'us' | 'student' = 'us'
+): Promise<Lead | null> {
   const { data, error } = await supabase.from('leads').insert({
     tenant_id: tenantId, source: n.source, external_id: n.external_id,
-    name: n.name, phone: n.phone, raw: n.raw, status: 'new',
+    name: n.name, phone: n.phone, raw: n.raw, status: 'new', initiated_by: initiatedBy,
   }).select('*').single();
   if (error) { console.error('[db] createLead', error.message); return null; }
   return data as Lead;

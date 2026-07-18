@@ -166,6 +166,15 @@ Classification falls out of the answers: **hot** = all three resolved (funds, or
 
 The brain returns the three answers in `extracted` (`decided_to_go`, `parents_convinced`, `finance_situation`, `loan_openness`, `scholarship_expectation`, plus `target_country`, `intake`, `documents_pending`), and `blocker` holds the single primary reason a lead is *not* hot (`none` when hot): `parents_not_convinced | undecided_to_go | scholarship_100_only | loan_refused_no_self_funding | money_unresolved | other`.
 
+### Entry mode: who messaged first
+
+Every lead carries `initiated_by`, set automatically at creation and fixed thereafter:
+
+- **`'us'`** — we reached out (Meta lead-form → opener template). The AI naturally *leads*: it opens warmly and guides the conversation toward the three questions.
+- **`'student'`** — they messaged the business first (plain "hi", a random question, or a **Click-to-WhatsApp ad** tap — those send no leadgen webhook, so their first message lands on the inbound-first path and is tagged automatically). The AI opens **human-first**: it engages with whatever the student actually said, answers light questions (safety rules still apply — no fees, no promises), and lets qualification *emerge* from the conversation instead of firing questions — while keeping a light hand on the wheel so it never degrades into a pure Q&A help-desk.
+
+This is one flag changing one **opening-posture** section of the shared prompt — the three-question judgment, safety rules, and routing are identical in both modes (deliberately: two brains would drift). It's independent of `source` and of `qualifying_config`.
+
 **AI safety (P0-3):** the prompt forbids stating fees/amounts/deadlines/percentages it wasn't given and forbids guaranteeing any outcome. A second-layer output guard scans every reply for currency/amount/percentage/guarantee patterns; flagged replies are replaced with a safe "the counsellor will confirm on a call" deflection and the original is sent to the operator (`reply_flagged`) for review. This **reduces but cannot eliminate** wrong statements — for high-value clients set `auto_handoff_on_hot=true` so a human owns the conversations that matter.
 
 ---

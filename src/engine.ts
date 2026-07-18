@@ -80,7 +80,7 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
     return;
   }
 
-  const lead = await db.createLead(tenant.id, normalized);
+  const lead = await db.createLead(tenant.id, normalized, 'us');
   if (!lead) {
     await alertOperator(tenant, 'lead_create_failed', `could not store lead for ${normalized.phone}`);
     return;
@@ -131,9 +131,11 @@ export async function handleInboundMessage(
   const phone = normalizePhone(from, tenant.default_country_code);
   let lead = await db.findLeadByPhone(tenant.id, phone);
 
-  // They messaged us without a prior lead record (e.g. inbound-first). Create one.
+  // They messaged us without a prior lead record — student-initiated (this is
+  // also where Click-to-WhatsApp ad taps land: no leadgen webhook, just their
+  // first message). The brain opens human-first for these.
   if (!lead) {
-    lead = await db.createLead(tenant.id, { source: 'manual', external_id: null, name, phone, raw: {} });
+    lead = await db.createLead(tenant.id, { source: 'manual', external_id: null, name, phone, raw: {} }, 'student');
     if (!lead) {
       await alertOperator(tenant, 'lead_create_failed', `could not store inbound-first lead ${phone}`);
       return;

@@ -38,6 +38,10 @@ export interface Lead {
   phone: string;
   raw: Record<string, unknown>;
   status: string;
+  // Who sent the first message: 'us' (we reached out) or 'student' (they
+  // messaged first, incl. Click-to-WhatsApp). Fixed at creation; drives only
+  // the brain's opening posture, never the judgment itself.
+  initiated_by: 'us' | 'student';
   classification: string | null;
   intent_level: string | null;
   blocker: string | null;
