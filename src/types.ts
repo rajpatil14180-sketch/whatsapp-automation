@@ -19,14 +19,29 @@ export interface Tenant {
   default_country_code: string | null;      // e.g. '91'; resolves national-format phones
   operator_wa: string | null;               // operator WhatsApp for system/failure alerts
   operator_email: string | null;            // optional email fallback (stubbed until provider wired)
-  followup_templates: string[];             // ordered APPROVED template names for no-reply nudges
-  followup_delays_minutes: number[];        // minutes after previous contact, index-aligned
-  max_followups: number;                    // hard cap on nudges to a non-replier
   counsellor_alert_template: string | null; // APPROVED template for hot-lead alerts
   reengagement_template: string | null;     // APPROVED template to reopen a closed 24h window
   qualifying_config: Partial<QualifyingConfig>; // per-vertical brain config; {} = study-abroad default
-  max_messages_per_lead: number;            // per-lead circuit breaker
-  auto_handoff_on_hot: boolean;             // human takes over once a lead is hot
+  max_messages_per_lead: number;            // RUNAWAY safety net only (default 100) — never the normal escalation path
+
+  // Migration 003 — two follow-up tracks. The old flat followup_* columns are
+  // deprecated; db.ts falls back to them when Track A is unconfigured.
+  noreply_followup_templates: string[];     // Track A: nudges for leads that NEVER replied (timed from opener)
+  noreply_followup_delays_minutes: number[];
+  noreply_max_followups: number;            // default 1 — caps dead-lead cost at opener + 1
+  stalled_followup_templates: string[];     // Track B: nudges for engaged-then-stalled leads (timed from last activity)
+  stalled_followup_delays_minutes: number[];
+  stalled_max_followups: number;            // default 2
+
+  // Migration 003 — profile-based opener selection; first matching rule wins,
+  // else wa_opening_template. Every referenced template must be Meta-approved.
+  opener_rules: OpenerRule[];
+}
+
+export interface OpenerRule {
+  when_field: string; // lead-form field name, e.g. "target_country"
+  equals: string;     // value to match (case-insensitive)
+  template: string;   // APPROVED opener template to use
 }
 
 export interface Lead {
@@ -50,8 +65,9 @@ export interface Lead {
 
   // Hardening pass (migration 001)
   last_contact_at: string | null;   // when WE last sent this lead anything
-  followups_sent: number;
-  next_followup_at: string | null;  // NULL = no nudge pending
+  followups_sent: number;           // Track A (never-replied) nudges sent
+  stalled_followups_sent: number;   // Track B (engaged-then-stalled) nudges sent
+  next_followup_at: string | null;  // next nudge/stall-check for EITHER track; NULL = none pending
   delivery_status: string | null;   // pending | sent | delivered | read | failed
   opted_out: boolean;
   human_handoff: boolean;
@@ -108,6 +124,7 @@ export interface BrainResult {
     scholarship_expectation?: 'full_required' | 'partial_ok' | 'not_discussed'; // when loan refused
     intake?: string | null;
     documents_pending?: string[];            // informational ONLY; never lowers a hot lead
+    meeting_time?: string | null;            // proposed/agreed counsellor-call time (the "booking")
     [k: string]: unknown;
   };
   recommended_action: 'book_call' | 'nurture' | 'chase_document' | 'close';
@@ -115,4 +132,9 @@ export interface BrainResult {
   reasoning: string;
   opt_out?: boolean;               // lead asked to stop being contacted
   conversation_complete?: boolean; // nothing left to do (e.g. call booked)
+  // AI-judged escalation: true ONLY when the AI is stuck, the lead is
+  // frustrated/confused, or the lead asked for a human. This — not any message
+  // count — is what hands the live conversation to a person.
+  needs_human?: boolean;
+  needs_human_reason?: 'stuck' | 'frustrated' | 'confused' | 'asked_for_human' | '';
 }

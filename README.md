@@ -18,10 +18,12 @@ POST /webhooks/meta ──► look up tenant by page_id
 fetch lead field-data from Graph API ──► normalize (libphonenumber) ──► store lead
       │                                        (duplicate active lead? attach, don't re-open)
       ▼
-send APPROVED OPENING TEMPLATE  (its only job: provoke a reply → opens 24h window)
+send APPROVED OPENING TEMPLATE  (picked by opener_rules from the form data, else the default;
+      │                          its only job: provoke a reply → opens 24h window)
       │        └─ send fails? → delivery_status='failed' + operator alert (never silent)
       │
-      ├─ no reply? ──► scheduler sends follow-up TEMPLATES at configured delays (max_followups cap)
+      ├─ never replies? ──► Track A: at most noreply_max_followups nudge(s) (default 1) — dead-lead cost capped
+      ├─ replied then went quiet? ──► Track B: up to stalled_max_followups nudges (default 2), timed from last activity
       ▼
 student replies ──► POST /webhooks/whatsapp ──► look up tenant by phone_number_id
       │                 (de-duped by wa_message_id; rapid-fire messages debounced ~4s)
@@ -31,7 +33,10 @@ runBrain() = Claude call ──► { classification, blocker, extracted, reply, 
       ├─► reply passes the SAFETY GUARD (no amounts / no guarantees) before sending
       ├─► send reply (free text inside 24h window; RE-ENGAGEMENT TEMPLATE if window closed)
       ├─► update lead status + extracted fields
-      └─► if HOT: counsellor alert via TEMPLATE (works with no open window) + operator redundancy
+      ├─► if HOT: counsellor gets the BOOKING (summary + proposed meeting_time) via TEMPLATE;
+      │          the AI KEEPS the chat and works to confirm the call time
+      └─► if the AI flags needs_human (stuck / frustrated / asked for a person):
+                 the LIVE CHAT is handed to a human (human_handoff) + counsellor/operator pinged
 ```
 
 **Two hard WhatsApp rules the code is built around:**
@@ -99,16 +104,19 @@ Important per-tenant fields:
 |---|---|---|
 | `default_country_code` | Resolves national-format phones (e.g. `'91'`) | none (recommended: set it) |
 | `operator_wa` | Where system/failure alerts go | falls back to `OPERATOR_WA` |
-| `followup_templates` | Ordered approved template names for no-reply nudges | `[]` (no follow-ups) |
-| `followup_delays_minutes` | Minutes after previous contact per nudge | `[180, 1440]` |
-| `max_followups` | Hard cap on nudges | `2` |
-| `counsellor_alert_template` | Approved template for hot-lead alerts | none (falls back to free text) |
+| `noreply_followup_templates` | **Track A**: nudges for leads that NEVER replied | `[]` (no nudges) |
+| `noreply_followup_delays_minutes` | Track A delays, from opener/previous contact | `[180]` |
+| `noreply_max_followups` | Track A cap — dead-lead cost stops at opener + this | `1` |
+| `stalled_followup_templates` | **Track B**: nudges for engaged-then-stalled leads | `[]` (no nudges) |
+| `stalled_followup_delays_minutes` | Track B delays, from **last activity** | `[1440, 4320]` |
+| `stalled_max_followups` | Track B cap | `2` |
+| `opener_rules` | Profile-based opener selection (see below) | `[]` (always default opener) |
+| `counsellor_alert_template` | Approved template for hot-lead booking alerts | none (falls back to free text) |
 | `reengagement_template` | Approved template to reopen a closed window | none (lead alerts operator instead) |
 | `qualifying_config` | Per-vertical brain config (see below) | `{}` = built-in study-abroad |
-| `max_messages_per_lead` | Per-lead circuit breaker | `30` |
-| `auto_handoff_on_hot` | Human takes over once a lead is hot | `false` |
+| `max_messages_per_lead` | RUNAWAY safety net only — never freezes a hot lead | `100` |
 
-An existing tenant with all defaults behaves exactly as before the hardening pass (no follow-ups, free-text counsellor alert, study-abroad brain).
+An existing tenant with all defaults behaves exactly as before (no follow-ups until templates are configured, free-text counsellor alert, study-abroad brain). Tenants configured with the old flat `followup_templates`/`followup_delays_minutes`/`max_followups` keep working unchanged: those deprecated columns are used as Track A whenever `noreply_followup_templates` is empty.
 
 ---
 
@@ -118,12 +126,14 @@ The system can only reference **approved** template names — approval is Meta b
 
 | Template (tenant field) | Purpose | Variables |
 |---|---|---|
-| `wa_opening_template` | Opener to a fresh lead | one `{{1}}` body var (first name) |
-| each name in `followup_templates` | No-reply nudges (P0-2) | one `{{1}}` body var (first name) |
+| `wa_opening_template` | Default opener to a fresh lead | one `{{1}}` body var (first name) |
+| each `template` in `opener_rules` | Profile-specific openers (picked from form data) | one `{{1}}` body var (first name) |
+| each name in `noreply_followup_templates` | Track A nudges (lead never replied) | one `{{1}}` body var (first name) |
+| each name in `stalled_followup_templates` | Track B nudges (engaged then stalled) | one `{{1}}` body var (first name) |
 | `reengagement_template` | Reopen a closed 24h window mid-conversation | one `{{1}}` body var (first name) |
-| `counsellor_alert_template` | Hot-lead alert to the counsellor | `{{1}}` lead name, `{{2}}` country/answer 1, `{{3}}` intake/answer 2, `{{4}}` wa.me link |
+| `counsellor_alert_template` | Hot-lead booking alert to the counsellor | `{{1}}` lead name, `{{2}}` country/answer 1, `{{3}}` intake/answer 2, `{{4}}` wa.me link |
 
-**Follow-up cost note:** every follow-up / re-engagement is a **billable marketing template** (India ≈ ₹0.86 each) because it's sent outside the 24h window. That's why `max_followups` defaults to 2 and there's a per-tenant daily template cap.
+**Follow-up cost logic:** every follow-up / re-engagement is a **billable marketing template** (India ≈ ₹0.86 each) because it's sent outside the 24h window. The two tracks exist to point that spend at the right leads: a lead that **never replied** is probably dead, so Track A caps them at **1** nudge (opener + 1 = worst-case dead-lead cost); a lead that **replied and then stalled** showed real intent, so Track B allows **2** nudges, timed from the end of the conversation (the later of their last message / our last message). There's also a per-tenant daily template cap as a backstop.
 
 **Operator alerts limitation:** alerts to `operator_wa` are free text, so they only deliver while *your own* 24h window with that business number is open. **Message each tenant's business number once from your operator phone and reply occasionally to keep the thread alive.** Every alert is also durably written to the `system_events` table (visible via `/stats`) regardless.
 
@@ -175,7 +185,30 @@ Every lead carries `initiated_by`, set automatically at creation and fixed there
 
 This is one flag changing one **opening-posture** section of the shared prompt — the three-question judgment, safety rules, and routing are identical in both modes (deliberately: two brains would drift). It's independent of `source` and of `qualifying_config`.
 
-**AI safety (P0-3):** the prompt forbids stating fees/amounts/deadlines/percentages it wasn't given and forbids guaranteeing any outcome. A second-layer output guard scans every reply for currency/amount/percentage/guarantee patterns; flagged replies are replaced with a safe "the counsellor will confirm on a call" deflection and the original is sent to the operator (`reply_flagged`) for review. This **reduces but cannot eliminate** wrong statements — for high-value clients set `auto_handoff_on_hot=true` so a human owns the conversations that matter.
+### Hot leads: the AI hands off the BOOKING, not the conversation
+
+A hot classification does **not** freeze the AI. The AI stays in the chat and drives toward one goal: **a confirmed time for the counsellor call** (offering options, converging, recording it in `extracted.meeting_time`). What the counsellor receives is the **booking** — the summary template/message with a `Proposed call:` line — not a live conversation to take over. The old `auto_handoff_on_hot` behavior is removed (the column remains in the DB but is ignored). **Automated calendar booking (real calendar events, live availability, slot offers, no-show loops) is still deferred** — for now "the booking" is the `meeting_time` carried in the counsellor notification.
+
+### Escalation: AI-judged, not message-counted
+
+The *live conversation* is handed to a human (`human_handoff = true`) only when the **AI itself flags `needs_human`** — because it's genuinely stuck/looping, the lead is frustrated or confused, or the lead asked for a person (`needs_human_reason`: `stuck | frustrated | confused | asked_for_human`). The prompt explicitly forbids escalating just because a conversation is long or because a hot lead is taking many messages — a smoothly-progressing hot lead is never escalated. On escalation the counsellor (if their window is open) and the operator get the reason plus the wa.me link.
+
+`max_messages_per_lead` (default now **100**) is only a **runaway safety net** against bugs/spammers: past the cap, a **hot** lead is never frozen (the operator gets a one-time `runaway_check` ping to glance at it and the AI continues); a non-hot lead is frozen via `human_handoff` as a cost/safety stop. Manual handoff (setting the DB flag) still works as before. The global Claude per-minute cap is unchanged.
+
+### Profile-based openers
+
+The opener must be a pre-approved template (cold contact — unchangeable WhatsApp rule), but you can have **several approved openers** and pick per lead. `opener_rules` is an ordered list matched against the lead form's answers; first match wins, otherwise `wa_opening_template`:
+
+```json
+[
+  { "when_field": "target_country", "equals": "Italy",   "template": "opener_italy" },
+  { "when_field": "target_country", "equals": "Ireland", "template": "opener_ireland" }
+]
+```
+
+Matching is case-insensitive on the form field's value. Every referenced template must be **created and approved in Meta** and take the same single `{{1}}` first-name variable. Follow-up and re-engagement templates are not profile-selected (deliberately simple).
+
+**AI safety (P0-3):** the prompt forbids stating fees/amounts/deadlines/percentages it wasn't given and forbids guaranteeing any outcome. A second-layer output guard scans every reply for currency/amount/percentage/guarantee patterns; flagged replies are replaced with a safe "the counsellor will confirm on a call" deflection and the original is sent to the operator (`reply_flagged`) for review. This **reduces but cannot eliminate** wrong statements — the AI-judged `needs_human` escalation (below) plus the `reply_flagged` review loop are the operational safeguards.
 
 ---
 
@@ -242,13 +275,15 @@ You don't need a live ad campaign to test the whole loop:
 - No-reply follow-up sequence (per-tenant templates/delays/cap) via the in-process scheduler
 - Inbound reply → de-dup → debounce → Claude qualification → safety-guarded reply → 24h-window-aware send with re-engagement fallback
 - Hot-lead counsellor alert via approved template + operator redundancy
-- Opt-out handling, per-lead & per-tenant & global circuit breakers, human-takeover switch
+- Opt-out handling, AI-judged `needs_human` escalation + runaway safety net, per-tenant & global cost caps, human-takeover switch
+- Hot-lead booking handoff (AI keeps the chat, counsellor gets summary + proposed `meeting_time`)
+- Two-track follow-ups (never-replied vs engaged-then-stalled) and profile-based opener selection
 - Operator alerting (`system_events` + WhatsApp + email stub), `/stats`, daily digest
 - Per-vertical brain config (`qualifying_config`) — new verticals are a tenant row, not a code change
 - Optional at-rest token encryption + `add-tenant` CLI
 
 **Deferred — explicitly NOT delivered in this pass:**
-- **Real calendar booking** — Google Calendar event creation, live counsellor availability, slot offers, no-show reminder loops. Today the counsellor gets an alert with a wa.me link; actual automated scheduling is a separate feature build.
+- **Real calendar booking** — Google Calendar event creation, live counsellor availability, slot offers, no-show reminder loops. Today "the booking" is the AI-negotiated `meeting_time` carried in the counsellor alert (with the wa.me link); actual automated scheduling is a separate feature build.
 - **Website-form lead intake** — the `NormalizedLead` seam is ready for it, but the website adapter itself is a separate small build (depends on each client's site/form tooling).
 - **Warm/cold nurture branches**, **full dashboard/analytics UI** — later, if clients ask.
 
@@ -256,7 +291,7 @@ You don't need a live ad campaign to test the whole loop:
 
 ## Residual risks & honest limits (what code cannot fully solve)
 
-1. **The AI can still occasionally say something wrong.** Prompt hardening + the output guard + optional human handoff sharply reduce it, but no technique guarantees a language model never makes an incorrect or awkward statement. For high-stakes clients, `auto_handoff_on_hot=true` is the real safeguard.
+1. **The AI can still occasionally say something wrong.** Prompt hardening + the output guard + AI-judged escalation sharply reduce it, but no technique guarantees a language model never makes an incorrect or awkward statement. The `reply_flagged` review loop and the `needs_human` handoff are the operational safeguards; a manual `human_handoff` flag is always available per lead.
 2. **Single-instance concurrency.** The rapid-fire debounce and the rate counters are in-memory: lost on restart, not shared across instances. Fine for one Railway instance; horizontal scaling needs a real queue (Redis/BullMQ) and distributed locks — a deliberate re-architecture later, not now.
 3. **Template approval is a Meta operational dependency.** Every template the system sends must be approved in Meta Business Manager first; approvals can be delayed or rejected. Not automatable here.
 4. **WhatsApp quality rating / deliverability.** If recipients block or report the number, Meta throttles sending. Opt-out handling, send caps, and clean templates help, but the rating is ultimately controlled by Meta and real user behavior.

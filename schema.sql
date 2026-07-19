@@ -143,6 +143,42 @@ create index if not exists system_events_created_idx on system_events (created_a
 -- Default 'us' so existing rows keep their current behavior.
 alter table leads add column if not exists initiated_by text not null default 'us';
 
+-- ============================================================
+-- MIGRATION 003 — smarter handoff, escalation, follow-ups, openers.
+-- Append-only: safe to run on an existing database.
+-- ============================================================
+
+-- CHANGE 1/2 — hot leads no longer freeze the AI; escalation is AI-judged.
+--   * tenants.auto_handoff_on_hot is DEPRECATED (column left in place, ignored
+--     by code). The AI now keeps hot conversations and hands the counsellor a
+--     BOOKING (summary + proposed meeting time), not a live chat.
+--   * max_messages_per_lead is re-purposed: no longer the normal escalation
+--     path, only a high runaway safety net against bugs/spammers.
+alter table tenants alter column max_messages_per_lead set default 100;
+update tenants set max_messages_per_lead = 100 where max_messages_per_lead = 30; -- lift old default rows to the new runaway intent
+
+-- CHANGE 3 — two follow-up tracks (replaces the flat followup_* fields, which
+-- are DEPRECATED but left in place; code falls back to them if the new
+-- noreply_* fields are unconfigured, so existing tenants keep working).
+-- Track A: lead NEVER replied — cheap, default 1 nudge, timed from opener.
+alter table tenants add column if not exists noreply_followup_templates jsonb not null default '[]';
+alter table tenants add column if not exists noreply_followup_delays_minutes jsonb not null default '[180]';
+alter table tenants add column if not exists noreply_max_followups int not null default 1;
+-- Track B: lead ENGAGED then stalled — worth more, default 2 nudges, timed
+-- from the last activity (later of last inbound / last outbound).
+alter table tenants add column if not exists stalled_followup_templates jsonb not null default '[]';
+alter table tenants add column if not exists stalled_followup_delays_minutes jsonb not null default '[1440, 4320]';
+alter table tenants add column if not exists stalled_max_followups int not null default 2;
+
+alter table leads add column if not exists stalled_followups_sent int not null default 0; -- Track B counter, independent of followups_sent (Track A)
+
+-- CHANGE 4 — profile-based opener selection. Ordered rules matched against the
+-- lead form's field data; first match wins, else wa_opening_template. Example:
+--   '[{"when_field":"target_country","equals":"Italy","template":"opener_italy"},
+--     {"when_field":"target_country","equals":"Ireland","template":"opener_ireland"}]'
+-- Every template referenced here must be APPROVED in Meta like any other.
+alter table tenants add column if not exists opener_rules jsonb not null default '[]';
+
 -- ------------------------------------------------------------
 -- Example: register your first client. Fill in the real values.
 -- ------------------------------------------------------------
@@ -150,13 +186,14 @@ alter table leads add column if not exists initiated_by text not null default 'u
 --   name, wa_phone_number_id, wa_token, wa_opening_template, wa_template_lang,
 --   meta_page_id, meta_page_token, business_name, agent_name, counsellor_wa,
 --   default_country_code, operator_wa,
---   followup_templates, followup_delays_minutes,
---   counsellor_alert_template, reengagement_template
+--   noreply_followup_templates, noreply_followup_delays_minutes,
+--   stalled_followup_templates, stalled_followup_delays_minutes,
+--   counsellor_alert_template, reengagement_template, opener_rules
 -- ) values (
 --   'Vivendo Overseas',
 --   '1234567890',                 -- WhatsApp phone_number_id
 --   'EAA...page-or-system-token', -- token to send WhatsApp messages
---   'lead_opener',                -- your approved template name (needs one {{1}} body var for first name)
+--   'lead_opener',                -- default APPROVED opener (one {{1}} body var for first name)
 --   'en',
 --   '9876543210',                 -- Facebook Page ID running the lead ads
 --   'EAA...page-access-token',    -- page token to fetch lead data
@@ -165,8 +202,11 @@ alter table leads add column if not exists initiated_by text not null default 'u
 --   '919999999999',               -- counsellor WhatsApp for hot-lead alerts
 --   '91',                         -- default country code for normalizing national-format phones
 --   '918888888888',               -- operator (you) WhatsApp for system/failure alerts
---   '["lead_followup_1","lead_followup_2"]',  -- APPROVED follow-up templates (each needs one {{1}} first-name var)
---   '[180, 1440]',                -- send nudge 1 after 3h, nudge 2 after 24h more
+--   '["lead_nudge_1"]',           -- Track A: nudge for never-repliers (one {{1}} first-name var); default cap 1
+--   '[180]',                      -- Track A: 3h after the opener
+--   '["lead_revive_1","lead_revive_2"]', -- Track B: nudges for engaged-then-stalled leads (one {{1}} var each)
+--   '[1440, 4320]',               -- Track B: 1 day, then 3 days, from last activity
 --   'hot_lead_alert',             -- APPROVED counsellor alert template ({{1}} name, {{2}} country, {{3}} intake, {{4}} wa.me link)
---   'lead_reengage'               -- APPROVED re-engagement template (one {{1}} first-name var)
+--   'lead_reengage',              -- APPROVED re-engagement template (one {{1}} first-name var)
+--   '[{"when_field":"target_country","equals":"Italy","template":"opener_italy"}]' -- optional per-profile openers (each APPROVED)
 -- );

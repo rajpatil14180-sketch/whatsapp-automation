@@ -1,7 +1,7 @@
 import * as db from './db';
 import * as wa from './whatsapp';
 import { alertOperator } from './operator';
-import { computeNextFollowupAt, tenantTemplateBudgetOk, noteTemplateSent } from './engine';
+import { computeNoreplyFollowupAt, computeStalledFollowupAt, tenantTemplateBudgetOk, noteTemplateSent } from './engine';
 import { config } from './config';
 
 // ============================================================
@@ -27,6 +27,12 @@ export function startScheduler(): void {
   console.log(`[scheduler] started (sweep every ${SWEEP_INTERVAL_MS / 1000}s)`);
 }
 
+// Two tracks (CHANGE 3), both driven by leads.next_followup_at:
+//   Track A "noreply" — never replied. Cheap: default 1 nudge, timed from the
+//   opener/previous contact. Caps dead-lead spend at opener + 1 template.
+//   Track B "stalled" — replied at least once, then went quiet without booking
+//   or closing. Worth more: default 2 nudges, timed from the last activity
+//   (markInbound/markOutboundContact restart that clock on every message).
 export async function sweepFollowups(): Promise<void> {
   const due = await db.getDueFollowupLeads();
   if (!due.length) return;
@@ -34,20 +40,22 @@ export async function sweepFollowups(): Promise<void> {
 
   for (const lead of due) {
     const tenant = lead.tenant;
+    const isStalled = lead.track === 'stalled';
+
+    // Pick the track's template list / counter / cap.
+    const sentSoFar = isStalled ? (lead.stalled_followups_sent ?? 0) : lead.followups_sent;
+    const cap = isStalled ? tenant.stalled_max_followups : tenant.noreply_max_followups;
+    const templates = isStalled ? tenant.stalled_followup_templates : tenant.noreply_followup_templates;
+    const templateName = (templates ?? [])[sentSoFar];
 
     // Belt and braces: the query filters most of this, but tenant config is per-row.
-    if (lead.followups_sent >= tenant.max_followups) {
-      await db.setNextFollowupAt(lead.id, null);
-      continue;
-    }
-    const templateName = (tenant.followup_templates ?? [])[lead.followups_sent];
-    if (!templateName) {
-      await db.setNextFollowupAt(lead.id, null); // exhausted the configured sequence
+    if (sentSoFar >= cap || !templateName) {
+      await db.setNextFollowupAt(lead.id, null); // exhausted/unconfigured for this track
       continue;
     }
     if (!tenantTemplateBudgetOk(tenant)) {
       await alertOperator(tenant, 'template_cap_reached',
-        `daily template cap hit — follow-up ${lead.followups_sent + 1} to ${lead.phone} deferred`, lead.id, 'warn');
+        `daily template cap hit — ${lead.track} follow-up ${sentSoFar + 1} to ${lead.phone} deferred`, lead.id, 'warn');
       await db.setNextFollowupAt(lead.id, new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString());
       continue;
     }
@@ -60,15 +68,20 @@ export async function sweepFollowups(): Promise<void> {
       const r = await wa.sendTemplate(tenant, lead.phone, [first], templateName);
       if (r.id) {
         noteTemplateSent(tenant);
-        const sent = lead.followups_sent + 1;
+        const sent = sentSoFar + 1;
         await db.appendMessage(lead.id, { direction: 'out', body: `[template:${templateName}]` }, r.id);
-        await db.recordFollowupSent(lead.id, sent, computeNextFollowupAt(tenant, sent));
-        console.log(`[scheduler] follow-up ${sent} sent to ${lead.phone} (${templateName})`);
+        if (isStalled) {
+          // The nudge itself is the latest activity — next stall check counts from it.
+          await db.recordStalledFollowupSent(lead.id, sent, computeStalledFollowupAt(tenant, sent));
+        } else {
+          await db.recordFollowupSent(lead.id, sent, computeNoreplyFollowupAt(tenant, sent));
+        }
+        console.log(`[scheduler] ${lead.track} follow-up ${sent} sent to ${lead.phone} (${templateName})`);
       } else {
         // Push the retry out 6h so a persistent failure doesn't hot-loop every sweep.
         await db.setNextFollowupAt(lead.id, new Date(Date.now() + 6 * 60 * 60 * 1000).toISOString());
         await alertOperator(tenant, 'followup_failed',
-          `follow-up "${templateName}" to ${lead.phone} failed: [${r.error?.code ?? '?'}] ${r.error?.message ?? 'unknown'}`, lead.id);
+          `${lead.track} follow-up "${templateName}" to ${lead.phone} failed: [${r.error?.code ?? '?'}] ${r.error?.message ?? 'unknown'}`, lead.id);
       }
     } finally {
       await db.releaseLead(lead.id);

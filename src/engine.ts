@@ -45,18 +45,58 @@ function claudeBudgetOk(): boolean {
   return true;
 }
 
-// When is the next no-reply nudge due, after `sentSoFar` follow-ups? (P0-2)
-export function computeNextFollowupAt(tenant: Tenant, sentSoFar: number): string | null {
-  const templates = tenant.followup_templates ?? [];
-  const remaining = Math.min(templates.length, tenant.max_followups);
+// Track A: next nudge for a lead that NEVER replied, after `sentSoFar` nudges.
+// Timed from the previous contact (opener or prior nudge). Default cap 1 —
+// dead leads get at most opener + 1 template.
+export function computeNoreplyFollowupAt(tenant: Tenant, sentSoFar: number): string | null {
+  const templates = tenant.noreply_followup_templates ?? [];
+  const remaining = Math.min(templates.length, tenant.noreply_max_followups);
   if (sentSoFar >= remaining) return null;
-  const delays = tenant.followup_delays_minutes ?? [];
+  const delays = tenant.noreply_followup_delays_minutes ?? [];
+  const minutes = delays[sentSoFar] ?? delays[delays.length - 1] ?? 180;
+  return new Date(Date.now() + minutes * 60_000).toISOString();
+}
+
+// Track B: next stall-check for a lead that ENGAGED then went quiet. Timed
+// from the last activity (callers invoke this whenever activity happens, so
+// "now" IS the last-activity moment). Null = track exhausted/unconfigured.
+export function computeStalledFollowupAt(tenant: Tenant, sentSoFar: number): string | null {
+  const templates = tenant.stalled_followup_templates ?? [];
+  const remaining = Math.min(templates.length, tenant.stalled_max_followups);
+  if (sentSoFar >= remaining) return null;
+  const delays = tenant.stalled_followup_delays_minutes ?? [];
   const minutes = delays[sentSoFar] ?? delays[delays.length - 1] ?? 1440;
   return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
 function firstName(name: string | null | undefined): string {
   return name?.trim().split(/\s+/)[0] || 'there';
+}
+
+// CHANGE 4: profile-based opener. Match the lead form's answers against the
+// tenant's ordered opener_rules; first match wins, else the default opener.
+// The opener still MUST be an approved template — rules only pick WHICH one.
+export function pickOpenerTemplate(tenant: Tenant, normalized: NormalizedLead): string {
+  const rules = tenant.opener_rules ?? [];
+  if (!rules.length) return tenant.wa_opening_template;
+
+  // Meta lead-form answers arrive as raw.field_data: [{ name, values: [...] }].
+  const fields: Record<string, string> = {};
+  const fieldData = (normalized.raw as { field_data?: unknown })?.field_data;
+  if (Array.isArray(fieldData)) {
+    for (const f of fieldData) {
+      if (f?.name) fields[String(f.name).toLowerCase()] = String((f.values ?? [])[0] ?? '');
+    }
+  }
+
+  for (const rule of rules) {
+    if (!rule?.when_field || !rule.template) continue;
+    const value = fields[rule.when_field.toLowerCase()];
+    if (value !== undefined && value.trim().toLowerCase() === String(rule.equals ?? '').trim().toLowerCase()) {
+      return rule.template;
+    }
+  }
+  return tenant.wa_opening_template;
 }
 
 // ============================================================
@@ -93,15 +133,17 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
     return;
   }
 
-  // Opener MUST be a template (cold contact, no 24h window yet).
-  // Template needs one {{1}} body variable for the first name.
-  const r = await wa.sendTemplate(tenant, normalized.phone, [firstName(normalized.name)]);
+  // Opener MUST be a template (cold contact, no 24h window yet). Which one is
+  // picked by the tenant's opener_rules against the form data (CHANGE 4).
+  // Every opener template needs one {{1}} body variable for the first name.
+  const opener = pickOpenerTemplate(tenant, normalized);
+  const r = await wa.sendTemplate(tenant, normalized.phone, [firstName(normalized.name)], opener);
   if (r.id) {
     noteTemplateSent(tenant);
-    await db.appendMessage(lead.id, { direction: 'out', body: `[template:${tenant.wa_opening_template}]` }, r.id);
-    // Success also schedules the first no-reply nudge (P0-2).
-    await db.markContacted(lead.id, computeNextFollowupAt(tenant, 0));
-    console.log(`[engine] opener sent to ${normalized.phone}`);
+    await db.appendMessage(lead.id, { direction: 'out', body: `[template:${opener}]` }, r.id);
+    // Success also schedules the first never-replied nudge (Track A).
+    await db.markContacted(lead.id, computeNoreplyFollowupAt(tenant, 0));
+    console.log(`[engine] opener "${opener}" sent to ${normalized.phone}`);
   } else {
     // P0-1: a failed opener is exactly the failure this product exists to prevent.
     await db.setDeliveryStatus(lead.id, 'failed');
@@ -118,6 +160,10 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
 // brain run per quiet period. In-memory + single-instance — see README.
 const DEBOUNCE_MS = 4000;
 const pendingTurns = new Map<string, { timer: NodeJS.Timeout; texts: string[] }>();
+
+// One runaway_check ping per lead per process — a hot lead past the runaway
+// cap keeps being served; the operator just gets told once to glance at it.
+const runawayAlerted = new Set<string>();
 
 const OPT_OUT_RE = /\b(stop|unsubscribe|not\s+interested|don'?t\s+(message|contact)|do\s+not\s+(message|contact)|remove\s+me)\b/i;
 
@@ -159,7 +205,9 @@ export async function handleInboundMessage(
     return;
   }
 
-  await db.markInbound(lead.id); // opens/refreshes the 24h window, cancels pending nudges
+  // Opens/refreshes the 24h window, cancels Track A nudges, resets and
+  // restarts the Track B stall clock from this moment of activity.
+  await db.markInbound(lead.id, computeStalledFollowupAt(tenant, 0));
 
   // P2-11: human owns this conversation — store + forward, never auto-reply.
   if (lead.human_handoff) {
@@ -187,13 +235,26 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
   const lead = await db.getLeadById(leadId);
   if (!lead || lead.opted_out || lead.human_handoff) return;
 
-  // P2-10: per-lead circuit breaker — a runaway conversation goes to a human.
+  // RUNAWAY SAFETY NET (last resort against bugs/spammers, ~100 msgs — NOT the
+  // normal escalation path; that is the AI's own needs_human judgment below).
+  // A hot lead is never frozen by this: long hot conversations are usually the
+  // lead being serious, so a human just gets pinged to glance at it.
   const msgCount = await db.countMessages(lead.id);
   if (msgCount > tenant.max_messages_per_lead) {
-    await db.setHumanHandoff(lead.id, true);
-    await alertOperator(tenant, 'circuit_breaker',
-      `lead ${lead.name ?? lead.phone} exceeded ${tenant.max_messages_per_lead} messages — auto-reply stopped, human handoff`, lead.id, 'warn');
-    return;
+    if (lead.classification === 'hot') {
+      if (!runawayAlerted.has(lead.id)) {
+        runawayAlerted.add(lead.id);
+        await alertOperator(tenant, 'runaway_check',
+          `hot lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages — AI continuing (hot leads are never frozen); please glance at the chat: https://wa.me/${lead.phone}`,
+          lead.id, 'warn');
+      }
+    } else {
+      await db.setHumanHandoff(lead.id, true);
+      await alertOperator(tenant, 'runaway_stop',
+        `lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages without becoming hot — auto-reply stopped as a cost/safety stop, human handoff`,
+        lead.id, 'warn');
+      return;
+    }
   }
 
   // P2-10: global Claude rate cap — skip this turn rather than blow the budget.
@@ -239,12 +300,28 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     await db.closeLead(lead.id, 'booked', 'booked');
   }
 
-  // Route hot leads: alert the counsellor immediately.
+  // Route hot leads: the counsellor gets the BOOKING (summary + proposed
+  // meeting time). The AI keeps the conversation and works to lock the time —
+  // a hot lead never freezes the AI (CHANGE 1).
   if (result.classification === 'hot') {
     await notifyCounsellor(tenant, lead, result);
-    if (tenant.auto_handoff_on_hot) {
-      await db.setHumanHandoff(lead.id, true);
-      await alertOperator(tenant, 'auto_handoff', `hot lead ${lead.name ?? lead.phone} handed to human (auto_handoff_on_hot)`, lead.id, 'info');
+  }
+
+  // AI-judged escalation (CHANGE 2): the ONE case where the live conversation
+  // is handed to a human — the AI is stuck, the lead is frustrated/confused,
+  // or the lead asked for a person. The handover reply above already went out.
+  if (result.needs_human) {
+    const reason = result.needs_human_reason || 'unspecified';
+    await db.setHumanHandoff(lead.id, true);
+    await alertOperator(tenant, 'needs_human',
+      `AI escalated ${lead.name ?? lead.phone} (reason: ${reason}) — take over the chat: https://wa.me/${lead.phone}`,
+      lead.id, 'warn');
+    if (tenant.counsellor_wa) {
+      const counsellorLead = await db.findLeadByPhone(tenant.id, tenant.counsellor_wa);
+      if (wa.canSendFreeText(counsellorLead?.last_inbound_at ?? null)) {
+        await wa.sendText(tenant, tenant.counsellor_wa,
+          `🙋 Human needed (${reason}) — ${lead.name ?? lead.phone}\nTake over the chat: https://wa.me/${lead.phone}`);
+      }
     }
   }
 }
@@ -261,7 +338,8 @@ export async function sendReply(tenant: Tenant, lead: Lead, text: string): Promi
     const r = await wa.sendText(tenant, lead.phone, text);
     if (r.id) {
       await db.appendMessage(lead.id, { direction: 'out', body: text }, r.id);
-      await db.markOutboundContact(lead.id);
+      // Our reply is activity — restart the Track B stall clock from now.
+      await db.markOutboundContact(lead.id, computeStalledFollowupAt(tenant, lead.stalled_followups_sent ?? 0));
       return;
     }
     if (!wa.isWindowClosedError(r.error)) {
@@ -286,7 +364,7 @@ export async function sendReply(tenant: Tenant, lead: Lead, text: string): Promi
   if (r.id) {
     noteTemplateSent(tenant);
     await db.appendMessage(lead.id, { direction: 'out', body: `[template:${tenant.reengagement_template}]` }, r.id);
-    await db.markOutboundContact(lead.id);
+    await db.markOutboundContact(lead.id, computeStalledFollowupAt(tenant, lead.stalled_followups_sent ?? 0));
     await alertOperator(tenant, 'window_closed_reengaged',
       `window closed for ${lead.phone}; sent re-engagement template instead of free text`, lead.id, 'warn');
   } else {
@@ -313,8 +391,11 @@ async function notifyCounsellor(tenant: Tenant, lead: Lead, r: BrainResult): Pro
     money += ')';
   }
   const docs = e.documents_pending?.length ? e.documents_pending.join(', ') : 'none noted';
+  // This is a BOOKING notification, not a conversation handoff — the AI keeps
+  // the chat and keeps working toward/confirming the call time.
   const summary =
     `🔥 HOT LEAD — ${lead.name ?? lead.phone}\n` +
+    `Proposed call: ${e.meeting_time ?? 'to be confirmed'}\n` +
     `Country: ${e.target_country ?? 'undecided'} | Intake: ${e.intake ?? '?'}\n` +
     `Decided to go: ${e.decided_to_go ?? '?'} | Parents: ${e.parents_convinced ?? '?'} | Money: ${money}\n` +
     `Docs to chase (not blockers): ${docs}\n` +

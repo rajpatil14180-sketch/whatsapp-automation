@@ -12,13 +12,29 @@ function hydrateTenant(row: any): Tenant {
   const t = row as Tenant;
   t.wa_token = decrypt(t.wa_token);
   if (t.meta_page_token) t.meta_page_token = decrypt(t.meta_page_token);
-  // jsonb columns can be null on rows created before the defaults existed.
-  t.followup_templates = (t.followup_templates as unknown as string[]) ?? [];
-  t.followup_delays_minutes = (t.followup_delays_minutes as unknown as number[]) ?? [180, 1440];
-  t.max_followups = t.max_followups ?? 2;
+  // Columns can be null/absent on rows created before the defaults existed.
   t.qualifying_config = t.qualifying_config ?? {};
-  t.max_messages_per_lead = t.max_messages_per_lead ?? 30;
-  t.auto_handoff_on_hot = t.auto_handoff_on_hot ?? false;
+  t.max_messages_per_lead = t.max_messages_per_lead ?? 100; // runaway safety net
+
+  // Track A (never replied). Legacy fallback: tenants configured before
+  // migration 003 keep their old flat followup_* behavior untouched.
+  const legacyTemplates = (row.followup_templates as string[] | null) ?? [];
+  if (!(row.noreply_followup_templates?.length) && legacyTemplates.length) {
+    t.noreply_followup_templates = legacyTemplates;
+    t.noreply_followup_delays_minutes = (row.followup_delays_minutes as number[] | null) ?? [180, 1440];
+    t.noreply_max_followups = (row.max_followups as number | null) ?? 2;
+  } else {
+    t.noreply_followup_templates = (row.noreply_followup_templates as string[] | null) ?? [];
+    t.noreply_followup_delays_minutes = (row.noreply_followup_delays_minutes as number[] | null) ?? [180];
+    t.noreply_max_followups = row.noreply_max_followups ?? 1;
+  }
+
+  // Track B (engaged then stalled).
+  t.stalled_followup_templates = (row.stalled_followup_templates as string[] | null) ?? [];
+  t.stalled_followup_delays_minutes = (row.stalled_followup_delays_minutes as number[] | null) ?? [1440, 4320];
+  t.stalled_max_followups = row.stalled_max_followups ?? 2;
+
+  t.opener_rules = (row.opener_rules as Tenant['opener_rules'] | null) ?? [];
   return t;
 }
 
@@ -112,21 +128,29 @@ export async function setDeliveryStatus(leadId: string, status: string): Promise
 }
 
 // Opens / refreshes the 24h WhatsApp window and marks the lead as engaged.
-// Also cancels any pending no-reply nudge — they're engaged now (P0-2).
-export async function markInbound(leadId: string): Promise<void> {
+// A reply cancels Track A (never-replied) nudges, resets the Track B counter
+// (a NEW stall episode gets the full stalled sequence), and restarts the stall
+// clock: `stallCheckAt` is when the first stalled nudge would fire if the
+// conversation goes quiet from this moment (null = Track B unconfigured).
+export async function markInbound(leadId: string, stallCheckAt: string | null): Promise<void> {
   const now = new Date().toISOString();
   const { error } = await supabase.from('leads')
-    .update({ last_inbound_at: now, status: 'engaged', next_followup_at: null, updated_at: now })
+    .update({
+      last_inbound_at: now, status: 'engaged',
+      stalled_followups_sent: 0, next_followup_at: stallCheckAt,
+      updated_at: now,
+    })
     .eq('id', leadId);
   if (error) console.error('[db] markInbound', error.message);
 }
 
-// We sent the lead something (free text or template) — drives follow-up timing.
-export async function markOutboundContact(leadId: string): Promise<void> {
+// We sent the lead something (free text or template). Our own message is
+// activity too, so it pushes the stall clock out when `stallCheckAt` is given.
+export async function markOutboundContact(leadId: string, stallCheckAt?: string | null): Promise<void> {
   const now = new Date().toISOString();
-  const { error } = await supabase.from('leads')
-    .update({ last_contact_at: now, updated_at: now })
-    .eq('id', leadId);
+  const update: Record<string, unknown> = { last_contact_at: now, updated_at: now };
+  if (stallCheckAt !== undefined) update.next_followup_at = stallCheckAt;
+  const { error } = await supabase.from('leads').update(update).eq('id', leadId);
   if (error) console.error('[db] markOutboundContact', error.message);
 }
 
@@ -170,18 +194,25 @@ export async function applyBrainResult(lead: Lead, r: BrainResult): Promise<void
   if (error) console.error('[db] applyBrainResult', error.message);
 }
 
-// --- Follow-up sweeper support (P0-2) ---
+// --- Follow-up sweeper support (P0-2 / two tracks) ---
+
+export type FollowupTrack = 'noreply' | 'stalled';
 
 export interface DueLead extends Lead {
   tenant: Tenant;
+  track: FollowupTrack;
 }
 
+// Due leads from BOTH tracks. `next_followup_at` is the single "next nudge or
+// stall-check" pointer for either track; which track applies falls out of the
+// status: 'contacted' = never replied (Track A), anything else still-open and
+// once-replied = engaged-then-stalled (Track B).
 export async function getDueFollowupLeads(): Promise<DueLead[]> {
   const now = new Date().toISOString();
   const { data, error } = await supabase
     .from('leads')
     .select('*, tenant:tenants(*)')
-    .eq('status', 'contacted')
+    .in('status', ['contacted', 'engaged', 'hot', 'warm', 'cold'])
     .eq('opted_out', false)
     .eq('human_handoff', false)
     .not('next_followup_at', 'is', null)
@@ -192,7 +223,8 @@ export async function getDueFollowupLeads(): Promise<DueLead[]> {
     .filter((row: any) => row.tenant)
     .map((row: any) => {
       const { tenant, ...lead } = row;
-      return { ...(lead as Lead), tenant: hydrateTenant(tenant) };
+      const track: FollowupTrack = lead.status === 'contacted' && !lead.last_inbound_at ? 'noreply' : 'stalled';
+      return { ...(lead as Lead), tenant: hydrateTenant(tenant), track };
     });
 }
 
@@ -217,6 +249,7 @@ export async function releaseLead(leadId: string): Promise<void> {
   if (error) console.error('[db] releaseLead', error.message);
 }
 
+// Track A nudge recorded (never-replied lead).
 export async function recordFollowupSent(leadId: string, followupsSent: number, nextFollowupAt: string | null): Promise<void> {
   const now = new Date().toISOString();
   const { error } = await supabase.from('leads')
@@ -229,6 +262,21 @@ export async function recordFollowupSent(leadId: string, followupsSent: number, 
     })
     .eq('id', leadId);
   if (error) console.error('[db] recordFollowupSent', error.message);
+}
+
+// Track B nudge recorded (engaged-then-stalled lead) — independent counter.
+export async function recordStalledFollowupSent(leadId: string, stalledSent: number, nextFollowupAt: string | null): Promise<void> {
+  const now = new Date().toISOString();
+  const { error } = await supabase.from('leads')
+    .update({
+      stalled_followups_sent: stalledSent,
+      last_contact_at: now,
+      next_followup_at: nextFollowupAt,
+      delivery_status: 'sent',
+      updated_at: now,
+    })
+    .eq('id', leadId);
+  if (error) console.error('[db] recordStalledFollowupSent', error.message);
 }
 
 export async function setNextFollowupAt(leadId: string, nextFollowupAt: string | null): Promise<void> {
