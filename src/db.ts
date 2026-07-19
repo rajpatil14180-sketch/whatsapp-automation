@@ -173,6 +173,15 @@ export async function closeLead(leadId: string, status: 'booked' | 'closed', rea
   if (error) console.error('[db] closeLead', error.message);
 }
 
+// The counsellor booking alert is once-per-lead, ever (Fix 5). Set BEFORE the
+// send so no later turn can fire a second alert for the same lead.
+export async function markHotAlerted(leadId: string): Promise<void> {
+  const { error } = await supabase.from('leads')
+    .update({ hot_alerted: true, updated_at: new Date().toISOString() })
+    .eq('id', leadId);
+  if (error) console.error('[db] markHotAlerted', error.message);
+}
+
 export async function setHumanHandoff(leadId: string, value: boolean): Promise<void> {
   const { error } = await supabase.from('leads')
     .update({ human_handoff: value, next_followup_at: value ? null : undefined, updated_at: new Date().toISOString() })

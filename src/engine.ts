@@ -161,6 +161,14 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
 const DEBOUNCE_MS = 4000;
 const pendingTurns = new Map<string, { timer: NodeJS.Timeout; texts: string[] }>();
 
+// Fix 3: per-lead turn lock. WhatsApp users type in fragments and brain
+// latency (2–5s) can exceed the debounce, so a fragment can land while a turn
+// is mid-flight. The lock guarantees ONE turn at a time per lead; fragments
+// that arrive during a turn wait and get answered in the NEXT single turn.
+const activeTurns = new Set<string>();
+
+const FALLBACK_REPLY = 'Thanks for your message! One of our counsellors will get back to you shortly. 🙏';
+
 // One runaway_check ping per lead per process — a hot lead past the runaway
 // cap keeps being served; the operator just gets told once to glance at it.
 const runawayAlerted = new Set<string>();
@@ -221,12 +229,39 @@ export async function handleInboundMessage(
   clearTimeout(entry.timer);
   entry.texts.push(text);
   entry.timer = setTimeout(() => {
-    processLeadTurn(tenant, lead!.id).catch((e) => console.error('[engine] turn error', e));
+    maybeRunTurn(tenant, lead!.id).catch((e) => console.error('[engine] turn error', e));
   }, DEBOUNCE_MS);
   pendingTurns.set(lead.id, entry);
 }
 
+// Fix 3: the lock covers the WHOLE turn (brain call + sends + writes). If the
+// timer fires while a turn is in flight, we simply return — the pending texts
+// stay queued, and the finally-block re-debounces them once the turn releases,
+// so mid-flight fragments are answered in one follow-up turn, never a parallel
+// one. In-memory + single-instance, like the debounce (see README).
+async function maybeRunTurn(tenant: Tenant, leadId: string): Promise<void> {
+  if (activeTurns.has(leadId)) return; // fragments re-scheduled on release below
+  activeTurns.add(leadId);
+  try {
+    await processLeadTurn(tenant, leadId);
+  } finally {
+    activeTurns.delete(leadId);
+    // Fragments that arrived mid-turn: give them a fresh quiet period, then run.
+    const entry = pendingTurns.get(leadId);
+    if (entry && entry.texts.length) {
+      clearTimeout(entry.timer);
+      entry.timer = setTimeout(() => {
+        maybeRunTurn(tenant, leadId).catch((e) => console.error('[engine] turn error', e));
+      }, DEBOUNCE_MS);
+    }
+  }
+}
+
 // Runs once per quiet period, on everything the lead sent since the last run.
+// Fix 2: the whole body is error-contained — any mid-turn throw (e.g. a DB
+// timeout) still ends with the student answered and the operator alerted; a
+// lead's turn can never fail silently. The reply is sent BEFORE the state
+// bookkeeping, so a late failure can't un-answer the student.
 async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
   const entry = pendingTurns.get(leadId);
   pendingTurns.delete(leadId);
@@ -235,97 +270,117 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
   const lead = await db.getLeadById(leadId);
   if (!lead || lead.opted_out || lead.human_handoff) return;
 
-  // RUNAWAY SAFETY NET (last resort against bugs/spammers, ~100 msgs — NOT the
-  // normal escalation path; that is the AI's own needs_human judgment below).
-  // A hot lead is never frozen by this: long hot conversations are usually the
-  // lead being serious, so a human just gets pinged to glance at it.
-  const msgCount = await db.countMessages(lead.id);
-  if (msgCount > tenant.max_messages_per_lead) {
-    if (lead.classification === 'hot') {
-      if (!runawayAlerted.has(lead.id)) {
-        runawayAlerted.add(lead.id);
-        await alertOperator(tenant, 'runaway_check',
-          `hot lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages — AI continuing (hot leads are never frozen); please glance at the chat: https://wa.me/${lead.phone}`,
+  let replied = false;
+  try {
+    // RUNAWAY SAFETY NET (last resort against bugs/spammers, ~100 msgs — NOT
+    // the normal escalation path; that is the AI's needs_human judgment below).
+    // A hot lead is never frozen by this: long hot conversations are usually
+    // the lead being serious, so a human just gets pinged to glance at it.
+    const msgCount = await db.countMessages(lead.id);
+    if (msgCount > tenant.max_messages_per_lead) {
+      if (lead.classification === 'hot') {
+        if (!runawayAlerted.has(lead.id)) {
+          runawayAlerted.add(lead.id);
+          await alertOperator(tenant, 'runaway_check',
+            `hot lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages — AI continuing (hot leads are never frozen); please glance at the chat: https://wa.me/${lead.phone}`,
+            lead.id, 'warn');
+        }
+      } else {
+        await db.setHumanHandoff(lead.id, true);
+        await alertOperator(tenant, 'runaway_stop',
+          `lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages without becoming hot — auto-reply stopped as a cost/safety stop, human handoff`,
           lead.id, 'warn');
+        return;
       }
-    } else {
-      await db.setHumanHandoff(lead.id, true);
-      await alertOperator(tenant, 'runaway_stop',
-        `lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages without becoming hot — auto-reply stopped as a cost/safety stop, human handoff`,
-        lead.id, 'warn');
+    }
+
+    // P2-10: global Claude rate cap — skip this turn rather than blow the budget.
+    if (!claudeBudgetOk()) {
+      console.warn(`[engine] Claude per-minute cap (${config.claudeCallsPerMinute}) hit — skipping turn for ${lead.phone}`);
+      await db.insertSystemEvent(tenant.id, lead.id, 'warn', 'claude_rate_capped', 'brain call skipped this turn');
       return;
     }
-  }
 
-  // P2-10: global Claude rate cap — skip this turn rather than blow the budget.
-  if (!claudeBudgetOk()) {
-    console.warn(`[engine] Claude per-minute cap (${config.claudeCallsPerMinute}) hit — skipping turn for ${lead.phone}`);
-    await db.insertSystemEvent(tenant.id, lead.id, 'warn', 'claude_rate_capped', 'brain call skipped this turn');
-    return;
-  }
+    const combined = entry.texts.join('\n');
+    const history = await db.getConversation(lead.id);
+    const prior = history.slice(0, Math.max(0, history.length - entry.texts.length));
 
-  const combined = entry.texts.join('\n');
-  const history = await db.getConversation(lead.id);
-  const prior = history.slice(0, Math.max(0, history.length - entry.texts.length));
+    const result = await runBrain(tenant, lead, prior, combined);
 
-  const result = await runBrain(tenant, lead, prior, combined);
+    if (!result) {
+      // Safety net: never ghost a lead if the brain fails or returns garbage.
+      await sendReply(tenant, lead, FALLBACK_REPLY);
+      replied = true;
+      await alertOperator(tenant, 'brain_failed', `brain returned nothing usable for ${lead.phone}; sent fallback`, lead.id, 'warn');
+      return;
+    }
 
-  if (!result) {
-    // Safety net: never ghost a lead if the brain fails.
-    await sendReply(tenant, lead, 'Thanks for your message! One of our counsellors will get back to you shortly. 🙏');
-    await alertOperator(tenant, 'brain_failed', `brain returned nothing for ${lead.phone}; sent fallback`, lead.id, 'warn');
-    return;
-  }
+    // P2-9: the brain detected stop intent the keyword filter missed.
+    if (result.opt_out) {
+      await db.markOptedOut(lead.id);
+      await alertOperator(tenant, 'lead_opted_out', `${lead.name ?? lead.phone} opted out (brain-detected)`, lead.id, 'info');
+      return;
+    }
 
-  // P2-9: the brain detected stop intent the keyword filter missed.
-  if (result.opt_out) {
-    await db.markOptedOut(lead.id);
-    await alertOperator(tenant, 'lead_opted_out', `${lead.name ?? lead.phone} opted out (brain-detected)`, lead.id, 'info');
-    return;
-  }
+    // P0-3: output guard — never let amounts/guarantees reach the lead.
+    const { safe, flagged } = sanitizeReply(result.reply);
 
-  // P0-3: output guard — never let amounts/guarantees reach the lead.
-  const { safe, flagged } = sanitizeReply(result.reply);
-  if (flagged) {
-    await alertOperator(tenant, 'reply_flagged', `guard replaced risky reply: "${result.reply}"`, lead.id, 'warn');
-  }
+    // Answer the student FIRST; everything below is bookkeeping that must
+    // never stand between the lead and a reply.
+    await sendReply(tenant, lead, safe);
+    replied = true;
 
-  await db.applyBrainResult(lead, result);
-  await sendReply(tenant, lead, safe);
+    if (flagged) {
+      await alertOperator(tenant, 'reply_flagged', `guard replaced risky reply: "${result.reply}"`, lead.id, 'warn');
+    }
 
-  // P2-9: conversation completion.
-  if (result.recommended_action === 'close') {
-    await db.closeLead(lead.id, 'closed', 'not_interested');
-  } else if (result.conversation_complete) {
-    await db.closeLead(lead.id, 'booked', 'booked');
-  }
+    await db.applyBrainResult(lead, result);
 
-  // Route hot leads: the counsellor gets the BOOKING (summary + proposed
-  // meeting time). The AI keeps the conversation and works to lock the time —
-  // a hot lead never freezes the AI (CHANGE 1).
-  if (result.classification === 'hot') {
-    await notifyCounsellor(tenant, lead, result);
-  }
+    // P2-9: conversation completion.
+    if (result.recommended_action === 'close') {
+      await db.closeLead(lead.id, 'closed', 'not_interested');
+    } else if (result.conversation_complete) {
+      await db.closeLead(lead.id, 'booked', 'booked');
+    }
 
-  // AI-judged escalation (CHANGE 2): the ONE case where the live conversation
-  // is handed to a human — the AI is stuck, the lead is frustrated/confused,
-  // or the lead asked for a person. The handover reply above already went out.
-  // Never for a hot lead: a hot lead asking for a human is the strongest
-  // buying signal, and the counsellor call being booked above IS that human —
-  // so the booking flow handles it and the AI stays active.
-  if (result.needs_human && result.classification !== 'hot') {
-    const reason = result.needs_human_reason || 'unspecified';
-    await db.setHumanHandoff(lead.id, true);
-    await alertOperator(tenant, 'needs_human',
-      `AI escalated ${lead.name ?? lead.phone} (reason: ${reason}) — take over the chat: https://wa.me/${lead.phone}`,
-      lead.id, 'warn');
-    if (tenant.counsellor_wa) {
-      const counsellorLead = await db.findLeadByPhone(tenant.id, tenant.counsellor_wa);
-      if (wa.canSendFreeText(counsellorLead?.last_inbound_at ?? null)) {
-        await wa.sendText(tenant, tenant.counsellor_wa,
-          `🙋 Human needed (${reason}) — ${lead.name ?? lead.phone}\nTake over the chat: https://wa.me/${lead.phone}`);
+    // Route hot leads: the counsellor gets the BOOKING (summary + proposed
+    // meeting time) — once per lead, once the summary is real (Fix 5). The AI
+    // keeps the conversation and works to lock the time (CHANGE 1).
+    if (result.classification === 'hot') {
+      await notifyCounsellor(tenant, lead, result);
+    }
+
+    // AI-judged escalation (CHANGE 2): the ONE case where the live conversation
+    // is handed to a human — the AI is stuck, the lead is frustrated/confused,
+    // or the lead asked for a person. The handover reply above already went out.
+    // Never for a hot lead: a hot lead asking for a human is the strongest
+    // buying signal, and the counsellor call being booked above IS that human —
+    // so the booking flow handles it and the AI stays active.
+    if (result.needs_human && result.classification !== 'hot') {
+      const reason = result.needs_human_reason || 'unspecified';
+      await db.setHumanHandoff(lead.id, true);
+      await alertOperator(tenant, 'needs_human',
+        `AI escalated ${lead.name ?? lead.phone} (reason: ${reason}) — take over the chat: https://wa.me/${lead.phone}`,
+        lead.id, 'warn');
+      if (tenant.counsellor_wa) {
+        const counsellorLead = await db.findLeadByPhone(tenant.id, tenant.counsellor_wa);
+        if (wa.canSendFreeText(counsellorLead?.last_inbound_at ?? null)) {
+          await wa.sendText(tenant, tenant.counsellor_wa,
+            `🙋 Human needed (${reason}) — ${lead.name ?? lead.phone}\nTake over the chat: https://wa.me/${lead.phone}`);
+        }
       }
     }
+  } catch (e) {
+    // Fix 2: a mid-turn failure must never silently ghost the lead.
+    console.error('[engine] turn failed for', lead.phone, e);
+    if (!replied) {
+      try { await sendReply(tenant, lead, FALLBACK_REPLY); } catch (e2) { console.error('[engine] fallback send also failed', e2); }
+    }
+    try {
+      await alertOperator(tenant, 'turn_error',
+        `turn for ${lead.name ?? lead.phone} threw ${replied ? 'AFTER the reply was sent (state writes may be incomplete)' : 'before any reply (fallback attempted)'}: ${e instanceof Error ? e.message : String(e)}`,
+        lead.id, 'error');
+    } catch (e3) { console.error('[engine] turn_error alert failed', e3); }
   }
 }
 
@@ -382,7 +437,27 @@ export async function sendReply(tenant: Tenant, lead: Lead, text: string): Promi
 // their window is open, operator alert as redundancy either way.
 // ============================================================
 async function notifyCounsellor(tenant: Tenant, lead: Lead, r: BrainResult): Promise<void> {
-  const e = r.extracted;
+  // Fix 5: this alert fires exactly ONCE per lead, ever.
+  if (lead.hot_alerted) return;
+
+  // Use everything known about the lead, not just this turn's increment.
+  const e = { ...(lead.extracted ?? {}), ...r.extracted } as BrainResult['extracted'];
+
+  // Fix 5: don't hand over a bare "hot" with no substance — wait until the AI
+  // has a real summary (core signals + at least one concrete detail). A later
+  // turn will alert once the detail exists; the brain is instructed to keep
+  // gathering it.
+  const known = (v: unknown) => v !== undefined && v !== null && v !== '' && v !== 'unclear';
+  const coreKnown = known(e.decided_to_go) && known(e.parents_convinced);
+  const detailKnown = known(e.target_country) || known(e.intake) || known(e.finance_situation);
+  if (!coreKnown || !detailKnown) {
+    console.log(`[engine] ${lead.phone} is hot but the summary is still thin — deferring the counsellor alert`);
+    return;
+  }
+
+  // Claim the one-shot BEFORE sending so no later turn can double-alert.
+  await db.markHotAlerted(lead.id);
+
   // Money line follows the Q3 sub-tree: loan stance only matters when financing
   // is needed; scholarship expectation only when a loan was refused.
   let money = e.finance_situation ?? '?';
@@ -404,7 +479,9 @@ async function notifyCounsellor(tenant: Tenant, lead: Lead, r: BrainResult): Pro
     `Docs to chase (not blockers): ${docs}\n` +
     `Blocker: ${r.blocker}\n` +
     `Why: ${r.reasoning}\n` +
-    `Chat: https://wa.me/${lead.phone}`;
+    `Student WhatsApp: +${lead.phone}\n` +
+    `Chat: https://wa.me/${lead.phone}\n` +
+    `Open this chat from the business WhatsApp account to view the full conversation.`;
 
   // Redundancy first: a hot lead must never be lost to a single failed channel.
   await alertOperator(tenant, 'hot_lead', summary, lead.id, 'info');

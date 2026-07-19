@@ -52,8 +52,9 @@ THE MONEY SUB-TREE (Q3):
 CLASSIFICATION, DERIVED FROM THE THREE ANSWERS:
 - "hot" — ALL of: decided to go = yes, parents convinced = yes, and money is resolved-enough (has funds, OR needs financing but open to a loan, OR refuses a loan but is okay with a partial scholarship + self-funding the rest). recommended_action "book_call". Any pending documents are noted in documents_pending but do NOT reduce this.
 
-HOT-LEAD GOAL — SECURE THE CALL TIME:
+HOT-LEAD GOAL — SECURE THE CALL TIME AND COMPLETE THE SUMMARY:
 Once a lead is hot, your job is to lock in a SPECIFIC time for the counsellor call: offer a couple of concrete options, converge on one, and record it in "meeting_time" (keep updating it if the time changes). YOU stay in the conversation and drive it to a confirmed time — you never go silent on a hot lead; what the counsellor receives is the booking (a summary plus the time), not the live chat. Only set conversation_complete once the time is confirmed.
+The counsellor handover happens ONCE, when there is a real summary — not the instant "hot" is first suspected. So keep the conversation flowing naturally until you have the handover details filled in: target country (or that it's genuinely undecided), intake, their money stance, and a proposed call time. Gather these through normal warm chat, never as a form.
 - "warm" — a genuine fundamental is unresolved but the lead is still workable and worth nurturing: parents are not convinced (the student decided but cannot convince their own parents — genuinely difficult and not something the consultancy can easily fix, so warm, NOT hot), OR not yet decided about going, OR money uncertainty has just been raised and the financing question is still being explored (stay warm until their loan/scholarship stance is clear, then re-classify).
 - "cold" — the weakest, lowest-priority (but still a lead — nobody is discarded): will only go with a 100% scholarship and refuses both a loan and any self-funding, or is clearly not committed to going at all. Light nurture only.
 
@@ -207,11 +208,49 @@ function parseBrain(raw: string): BrainResult | null {
     const start = clean.indexOf('{');
     const end = clean.lastIndexOf('}');
     if (start === -1 || end === -1) throw new Error('no JSON object found in model output');
-    return JSON.parse(clean.slice(start, end + 1)) as BrainResult;
+    return validateBrainResult(JSON.parse(clean.slice(start, end + 1)));
   } catch (e) {
     console.error('[brain] parse failed:', e, '\nraw:', raw);
     return null;
   }
+}
+
+// LLMs occasionally return partial/odd JSON. Never let that flow downstream:
+// a missing/non-string reply makes the whole result a failure (null → the
+// engine's safe-fallback path); every other field is coerced to a safe default
+// so notifyCounsellor and friends always receive a well-formed object.
+function validateBrainResult(obj: unknown): BrainResult | null {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    console.error('[brain] output is not an object; rejecting');
+    return null;
+  }
+  const o = obj as Record<string, unknown>;
+
+  const reply = typeof o.reply === 'string' ? o.reply.trim() : '';
+  if (!reply) {
+    console.error('[brain] output has no usable reply; rejecting:', JSON.stringify(o).slice(0, 300));
+    return null; // the student must never receive "undefined"/"null"/a number
+  }
+
+  const oneOf = <T extends string>(v: unknown, allowed: readonly T[], fallback: T): T =>
+    typeof v === 'string' && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+
+  return {
+    classification: oneOf(o.classification, ['hot', 'warm', 'cold'] as const, 'warm'), // safe middle
+    intent_level: oneOf(o.intent_level, ['high', 'medium', 'low'] as const, 'medium'),
+    blocker: typeof o.blocker === 'string' && o.blocker ? o.blocker : 'none',
+    extracted:
+      o.extracted && typeof o.extracted === 'object' && !Array.isArray(o.extracted)
+        ? (o.extracted as BrainResult['extracted'])
+        : {},
+    recommended_action: oneOf(o.recommended_action, ['book_call', 'nurture', 'chase_document', 'close'] as const, 'nurture'),
+    reply,
+    reasoning: typeof o.reasoning === 'string' ? o.reasoning : '',
+    opt_out: o.opt_out === true,
+    conversation_complete: o.conversation_complete === true,
+    needs_human: o.needs_human === true,
+    needs_human_reason: oneOf(o.needs_human_reason, ['stuck', 'frustrated', 'confused', 'asked_for_human', ''] as const, ''),
+  };
 }
 
 // ============================================================
@@ -225,13 +264,19 @@ const RISK_PATTERNS: RegExp[] = [
   /[₹$€£]\s*\d/,                                      // currency symbol + amount
   /\d[\d,.]*\s*(lakh|lakhs|crore|crores)\b/i,          // Indian amount words
   /\d[\d,.]*\s*k\b/i,                                  // "50k"
-  /\d[\d,.]*\s*%/,                                     // percentages (also catches "100%")
+  // Percentages ONLY in a money/scholarship context: "100% scholarship" and
+  // "50% fee waiver" flag; "100% of our support" passes.
+  /\d[\d,.]*\s*%[^.!?]{0,30}\b(scholarship|fee|fees|waiver|discount|funding|tuition)\b/i,
+  /\b(scholarship|fee|fees|waiver|discount|funding|tuition)\b[^.!?]{0,30}\d[\d,.]*\s*%/i,
   /\d[\d,.]*\s*(\/|per\s*)(year|yr|month|annum|sem(ester)?)\b/i, // "20,000/year"
   /\bguaranteed?\b/i,
   /\bassured\b/i,
   /\bconfirmed\s+admission\b/i,
   /\bsure\s+to\s+get\b/i,
-  /\bapproved\b/i,                                     // "your visa will be approved"
+  // "approved" ONLY in the risky sense (promising a visa/admission/loan
+  // outcome). "documents approved by the university" passes.
+  /\b(visa|admission|application|loan)\b[^.!?]{0,20}\bapprov(ed|al)\b/i,
+  /\bapprov(ed|al)\b[^.!?]{0,20}\b(visa|admission|application|loan)\b/i,
 ];
 
 const SAFE_DEFLECTION =

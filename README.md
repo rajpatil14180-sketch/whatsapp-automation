@@ -189,6 +189,8 @@ This is one flag changing one **opening-posture** section of the shared prompt �
 
 A hot classification does **not** freeze the AI. The AI stays in the chat and drives toward one goal: **a confirmed time for the counsellor call** (offering options, converging, recording it in `extracted.meeting_time`). What the counsellor receives is the **booking** — the summary template/message with a `Proposed call:` line — not a live conversation to take over. The old `auto_handoff_on_hot` behavior is removed (the column remains in the DB but is ignored). **Automated calendar booking (real calendar events, live availability, slot offers, no-show loops) is still deferred** — for now "the booking" is the `meeting_time` carried in the counsellor notification.
 
+The counsellor alert is sent **exactly once per lead, ever** (`leads.hot_alerted`), and only once the AI has a **real summary** to hand over: the decided/parents answers must be known plus at least one of country / intake / money stance. A lead flagged hot with a thin summary is not alerted yet — the brain keeps gathering the details and the alert fires on a later turn. The message includes the student's WhatsApp number and wa.me link, with a note to open the chat from the business WhatsApp account.
+
 ### Escalation: AI-judged, not message-counted
 
 The *live conversation* is handed to a human (`human_handoff = true`) only when the **AI itself flags `needs_human`** — because it's genuinely stuck/looping, the lead is frustrated or confused, or the lead asked for a person (`needs_human_reason`: `stuck | frustrated | confused | asked_for_human`). The prompt explicitly forbids escalating just because a conversation is long or because a hot lead is taking many messages — a smoothly-progressing hot lead is never escalated. On escalation the counsellor (if their window is open) and the operator get the reason plus the wa.me link.
@@ -276,6 +278,7 @@ You don't need a live ad campaign to test the whole loop:
 - Inbound reply → de-dup → debounce → Claude qualification → safety-guarded reply → 24h-window-aware send with re-engagement fallback
 - Hot-lead counsellor alert via approved template + operator redundancy
 - Opt-out handling, AI-judged `needs_human` escalation + runaway safety net, per-tenant & global cost caps, human-takeover switch
+- Turn-level reliability: brain output validated/coerced (malformed JSON → safe fallback, never "undefined" to a student), reply sent before state bookkeeping, any mid-turn failure answers the student + alerts the operator (`turn_error`), and a per-lead lock ensures one turn at a time even when fragments outpace the AI's latency
 - Hot-lead booking handoff (AI keeps the chat, counsellor gets summary + proposed `meeting_time`)
 - Two-track follow-ups (never-replied vs engaged-then-stalled) and profile-based opener selection
 - Operator alerting (`system_events` + WhatsApp + email stub), `/stats`, daily digest

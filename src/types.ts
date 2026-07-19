@@ -71,6 +71,7 @@ export interface Lead {
   delivery_status: string | null;   // pending | sent | delivered | read | failed
   opted_out: boolean;
   human_handoff: boolean;
+  hot_alerted: boolean;             // the once-ever counsellor booking alert has been sent
   closed_reason: string | null;     // booked | opted_out | exhausted | not_interested | error | other
   processing_until: string | null;  // lightweight sweeper claim
 }

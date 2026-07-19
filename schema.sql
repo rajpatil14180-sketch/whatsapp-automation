@@ -179,6 +179,16 @@ alter table leads add column if not exists stalled_followups_sent int not null d
 -- Every template referenced here must be APPROVED in Meta like any other.
 alter table tenants add column if not exists opener_rules jsonb not null default '[]';
 
+-- ============================================================
+-- MIGRATION 004 — production-readiness (round 3).
+-- Append-only: safe to run on an existing database.
+-- ============================================================
+
+-- The counsellor hot-lead BOOKING alert fires exactly once per lead, ever,
+-- and only once the AI has a real summary to hand over. This flag records
+-- that the one alert has been sent.
+alter table leads add column if not exists hot_alerted boolean not null default false;
+
 -- ------------------------------------------------------------
 -- Example: register your first client. Fill in the real values.
 -- ------------------------------------------------------------
