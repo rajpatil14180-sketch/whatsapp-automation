@@ -310,7 +310,10 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
   // AI-judged escalation (CHANGE 2): the ONE case where the live conversation
   // is handed to a human — the AI is stuck, the lead is frustrated/confused,
   // or the lead asked for a person. The handover reply above already went out.
-  if (result.needs_human) {
+  // Never for a hot lead: a hot lead asking for a human is the strongest
+  // buying signal, and the counsellor call being booked above IS that human —
+  // so the booking flow handles it and the AI stays active.
+  if (result.needs_human && result.classification !== 'hot') {
     const reason = result.needs_human_reason || 'unspecified';
     await db.setHumanHandoff(lead.id, true);
     await alertOperator(tenant, 'needs_human',
