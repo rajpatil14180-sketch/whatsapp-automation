@@ -1,8 +1,8 @@
-import Anthropic from '@anthropic-ai/sdk';
+import Groq from 'groq-sdk';
 import { config } from './config';
 import { Tenant, Lead, StoredMessage, BrainResult, QualifyingConfig } from './types';
 
-const client = new Anthropic({ apiKey: config.anthropicKey });
+const client = new Groq({ apiKey: config.groqKey });
 
 // ============================================================
 // THIS FILE IS THE PRODUCT.
@@ -168,6 +168,22 @@ function transcriptText(history: StoredMessage[]): string {
   return history.map((m) => `${m.direction === 'in' ? 'LEAD' : 'US'}: ${m.body ?? ''}`).join('\n');
 }
 
+// Reasoning models (e.g. openai/gpt-oss-120b) spend part of the completion
+// budget on hidden reasoning tokens before ever writing the JSON reply, so the
+// limit has to cover reasoning + the reply comfortably, not just the reply.
+const BASE_MAX_COMPLETION_TOKENS = 2048;
+const RETRY_MAX_COMPLETION_TOKENS = 4096;
+
+const ALLOWED_REASONING_EFFORTS = ['none', 'default', 'low', 'medium', 'high'] as const;
+type ReasoningEffort = (typeof ALLOWED_REASONING_EFFORTS)[number];
+
+function resolveReasoningEffort(): ReasoningEffort {
+  const v = config.groqReasoningEffort;
+  if ((ALLOWED_REASONING_EFFORTS as readonly string[]).includes(v)) return v as ReasoningEffort;
+  console.warn(`[brain] invalid GROQ_REASONING_EFFORT "${v}"; defaulting to "low"`);
+  return 'low';
+}
+
 export async function runBrain(
   tenant: Tenant,
   lead: Lead,
@@ -185,17 +201,50 @@ THE LEAD JUST SENT:
 
 Analyse and respond with the JSON object only.`;
 
-  try {
-    const res = await client.messages.create({
-      model: config.anthropicModel,
-      max_tokens: 1024,
-      // Old rows from before migration 002 can lack the column at runtime → default 'us'.
-      system: systemPrompt(tenant, lead.initiated_by ?? 'us'),
-      messages: [{ role: 'user', content: user }],
+  // Old rows from before migration 002 can lack the column at runtime → default 'us'.
+  const system = systemPrompt(tenant, lead.initiated_by ?? 'us');
+  const reasoningEffort = resolveReasoningEffort();
+
+  // One attempt at a given token budget. Kept as a closure so the automatic
+  // retry (below) can re-run the identical request with a higher limit
+  // without duplicating the call/logging logic.
+  const attempt = async (maxCompletionTokens: number): Promise<BrainResult | null> => {
+    const res = await client.chat.completions.create({
+      model: config.groqModel,
+      max_completion_tokens: maxCompletionTokens, // max_tokens is deprecated on Groq's API in favor of this
+      reasoning_effort: reasoningEffort, // kept small by default — this is a latency-sensitive instant-response product
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
     });
-    const block = res.content.find((b) => b.type === 'text');
-    const raw = block && block.type === 'text' ? block.text : '';
-    return parseBrain(raw);
+    const choice = res.choices[0];
+    const finishReason = choice?.finish_reason;
+    if (finishReason === 'length') {
+      // Distinct from a parse failure: the model was cut off mid-answer, not
+      // confused. Must be immediately identifiable in logs, not just "bad JSON".
+      console.warn(
+        `[brain] TRUNCATED completion (finish_reason=length, max_completion_tokens=${maxCompletionTokens}) — reasoning + reply did not fit in the token budget`
+      );
+    } else {
+      console.log(`[brain] completion finished (finish_reason=${finishReason ?? 'unknown'})`);
+    }
+    return parseBrain(choice?.message?.content ?? '');
+  };
+
+  try {
+    const result = await attempt(BASE_MAX_COMPLETION_TOKENS);
+    if (result) return result;
+
+    // A first-attempt parse failure is most often truncation, not a genuinely
+    // malformed reply — one retry at a higher budget before giving up.
+    console.warn('[brain] parse failed on first attempt; retrying once with a higher token limit');
+    const retryResult = await attempt(RETRY_MAX_COMPLETION_TOKENS);
+    if (retryResult) return retryResult;
+
+    console.error('[brain] parse failed again after retry; giving up for this turn');
+    return null;
   } catch (e) {
     console.error('[brain] error', e);
     return null;

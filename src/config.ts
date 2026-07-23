@@ -10,9 +10,12 @@ export const config = {
   supabaseUrl: process.env.SUPABASE_URL || '',
   supabaseKey: process.env.SUPABASE_SERVICE_KEY || '',
 
-  anthropicKey: process.env.ANTHROPIC_API_KEY || '',
-  // Swap to claude-haiku-4-5-20251001 for lower cost at scale; sonnet for best reply quality.
-  anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
+  groqKey: process.env.GROQ_API_KEY || '',
+  // Free, fast default; swap to llama-3.3-70b-versatile for higher reply quality.
+  groqModel: process.env.GROQ_MODEL || 'llama-3.1-8b-instant',
+  // Reasoning-model budget (e.g. openai/gpt-oss-120b): kept low by default since
+  // this is a latency-sensitive instant-response product. Validated in brain.ts.
+  groqReasoningEffort: process.env.GROQ_REASONING_EFFORT || 'low',
 
   // Global fallback operator WhatsApp number, used when a tenant has no operator_wa.
   operatorWa: process.env.OPERATOR_WA || '',
@@ -31,7 +34,7 @@ export function assertConfig(): void {
     ['META_VERIFY_TOKEN', config.verifyToken],
     ['SUPABASE_URL', config.supabaseUrl],
     ['SUPABASE_SERVICE_KEY', config.supabaseKey],
-    ['ANTHROPIC_API_KEY', config.anthropicKey],
+    ['GROQ_API_KEY', config.groqKey],
   ];
   const missing = required.filter(([, v]) => !v).map(([k]) => k);
   if (missing.length) {

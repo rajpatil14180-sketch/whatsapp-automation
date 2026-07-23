@@ -1,6 +1,6 @@
 # Lead Response System
 
-Catches Meta lead-ad submissions the instant they arrive, opens a WhatsApp conversation, qualifies the lead with Claude (intent + blocker + extracted fields), replies in real time, follows up with non-repliers, and alerts a counsellor the moment a lead is hot.
+Catches Meta lead-ad submissions the instant they arrive, opens a WhatsApp conversation, qualifies the lead with Groq (intent + blocker + extracted fields), replies in real time, follows up with non-repliers, and alerts a counsellor the moment a lead is hot.
 
 Built **multi-tenant** — one row in the `tenants` table per consultancy you serve. Adding a client is a config insert, not a code change.
 
@@ -28,7 +28,7 @@ send APPROVED OPENING TEMPLATE  (picked by opener_rules from the form data, else
 student replies ──► POST /webhooks/whatsapp ──► look up tenant by phone_number_id
       │                 (de-duped by wa_message_id; rapid-fire messages debounced ~4s)
       ▼
-runBrain() = Claude call ──► { classification, blocker, extracted, reply, reasoning }
+runBrain() = Groq call ──► { classification, blocker, extracted, reply, reasoning }
       │
       ├─► reply passes the SAFETY GUARD (no amounts / no guarantees) before sending
       ├─► send reply (free text inside 24h window; RE-ENGAGEMENT TEMPLATE if window closed)
@@ -56,7 +56,7 @@ src/
   meta.ts        Meta Lead Ads adapter: parse webhook, fetch field data, normalize
   whatsapp.ts    WhatsApp Cloud API: send template/text (+retry), parse inbound + statuses, 24h helper
   phone.ts       Robust phone normalization (libphonenumber-js) shared by every intake path
-  brain.ts       THE PRODUCT — per-vertical Claude prompt + output safety guard
+  brain.ts       THE PRODUCT — per-vertical Groq prompt + output safety guard
   engine.ts      Orchestration: new-lead flow, inbound flow (debounce, opt-out, breakers), counsellor alert
   scheduler.ts   Background sweeper: no-reply follow-ups + daily operator digest
   operator.ts    Operator alerting: system_events row + WhatsApp + email stub
@@ -78,7 +78,9 @@ schema.sql       Supabase tables + append-only migrations (safe to re-run)
 Create a project, open the SQL editor, paste and run `schema.sql`. It is **append-only / idempotent** — re-running it on an existing database applies only the new migrations. Grab your project URL and the **service role** key.
 
 ### 2. Env
-Copy `.env.example` to `.env` and fill it in. New since the hardening pass:
+Copy `.env.example` to `.env` and fill it in. The brain runs on **Groq**: get a free `GROQ_API_KEY` from [console.groq.com](https://console.groq.com) — no billing setup or card required — and leave `GROQ_MODEL` at the default `llama-3.1-8b-instant` (fast, free) unless you want to upgrade to `llama-3.3-70b-versatile` for higher reply quality. Groq was chosen after hitting payment-method walls trying to provision Anthropic, OpenAI, and Gemini keys — its free tier needs neither a card nor a billing account to start sending real traffic.
+
+New since the hardening pass:
 - `OPERATOR_WA` — your WhatsApp number (global fallback for system/failure alerts; per-tenant `operator_wa` wins).
 - `STATS_TOKEN` — secret for `GET /stats?token=...`. Endpoint is off if unset.
 - `ENCRYPTION_KEY` — optional; see **Token encryption** below before setting it.
@@ -195,7 +197,7 @@ The counsellor alert is sent **exactly once per lead, ever** (`leads.hot_alerted
 
 The *live conversation* is handed to a human (`human_handoff = true`) only when the **AI itself flags `needs_human`** — because it's genuinely stuck/looping, the lead is frustrated or confused, or the lead asked for a person (`needs_human_reason`: `stuck | frustrated | confused | asked_for_human`). The prompt explicitly forbids escalating just because a conversation is long or because a hot lead is taking many messages — a smoothly-progressing hot lead is never escalated. On escalation the counsellor (if their window is open) and the operator get the reason plus the wa.me link.
 
-`max_messages_per_lead` (default now **100**) is only a **runaway safety net** against bugs/spammers: past the cap, a **hot** lead is never frozen (the operator gets a one-time `runaway_check` ping to glance at it and the AI continues); a non-hot lead is frozen via `human_handoff` as a cost/safety stop. Manual handoff (setting the DB flag) still works as before. The global Claude per-minute cap is unchanged.
+`max_messages_per_lead` (default now **100**) is only a **runaway safety net** against bugs/spammers: past the cap, a **hot** lead is never frozen (the operator gets a one-time `runaway_check` ping to glance at it and the AI continues); a non-hot lead is frozen via `human_handoff` as a cost/safety stop. Manual handoff (setting the DB flag) still works as before. The global brain-call-per-minute cap is unchanged (env var still named `CLAUDE_CALLS_PER_MINUTE` for historical reasons — it throttles brain calls regardless of provider).
 
 ### Profile-based openers
 
@@ -275,7 +277,7 @@ You don't need a live ad campaign to test the whole loop:
 - Meta lead intake → normalize (libphonenumber, per-tenant country code) → store, with attach-not-duplicate for repeat submissions
 - Opening template send with retry/backoff, failure alerts, and delivery-status tracking from Meta's status webhooks
 - No-reply follow-up sequence (per-tenant templates/delays/cap) via the in-process scheduler
-- Inbound reply → de-dup → debounce → Claude qualification → safety-guarded reply → 24h-window-aware send with re-engagement fallback
+- Inbound reply → de-dup → debounce → Groq qualification → safety-guarded reply → 24h-window-aware send with re-engagement fallback
 - Hot-lead counsellor alert via approved template + operator redundancy
 - Opt-out handling, AI-judged `needs_human` escalation + runaway safety net, per-tenant & global cost caps, human-takeover switch
 - Turn-level reliability: brain output validated/coerced (malformed JSON → safe fallback, never "undefined" to a student), reply sent before state bookkeeping, any mid-turn failure answers the student + alerts the operator (`turn_error`), and a per-lead lock ensures one turn at a time even when fragments outpace the AI's latency

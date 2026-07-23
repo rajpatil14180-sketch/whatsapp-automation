@@ -2,7 +2,7 @@
   "name": "lead-response-system",
   "version": "0.1.0",
   "private": true,
-  "description": "Multi-tenant WhatsApp lead-response system: catches Meta leads, qualifies them with Claude, alerts counsellors.",
+  "description": "Multi-tenant WhatsApp lead-response system: catches Meta leads, qualifies them with Groq, alerts counsellors.",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
@@ -10,9 +10,10 @@
     "add-tenant": "tsx scripts/add-tenant.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.32.1",
     "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^17.4.2",
     "express": "^4.19.2",
+    "groq-sdk": "^1.3.0",
     "libphonenumber-js": "^1.11.12"
   },
   "devDependencies": {
