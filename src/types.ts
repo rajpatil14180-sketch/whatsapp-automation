@@ -104,6 +104,8 @@ export interface QualifyingConfig {
   persona_notes?: string;         // optional tone/persona guidance
   extracted_schema?: string;      // optional exact JSON shape of "extracted" shown in the output
                                   // schema (types/enums); falls back to fields_to_extract names
+  core_signal_fields?: string[]; // the extracted fields that must be known before this lead can be
+                                  // scored; drives the "STILL UNKNOWN" line and the conversation-alive rules
 }
 
 // What the brain returns for every inbound message. This is the product's core.

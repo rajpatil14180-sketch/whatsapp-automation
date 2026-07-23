@@ -158,7 +158,11 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
 
 // P1-5: rapid-fire messages ("hi" / "you there?" / "hello?") coalesce into ONE
 // brain run per quiet period. In-memory + single-instance — see README.
-const DEBOUNCE_MS = 4000;
+// Trade-off: higher = better coalescing of slow typing bursts (people often
+// pause 4-6s between WhatsApp fragments), at the cost of a slightly slower
+// first reply. 7s was chosen after live testing showed 4s split real bursts
+// into separate turns.
+const DEBOUNCE_MS = 7000;
 const pendingTurns = new Map<string, { timer: NodeJS.Timeout; texts: string[] }>();
 
 // Fix 3: per-lead turn lock. WhatsApp users type in fragments and brain
@@ -166,6 +170,16 @@ const pendingTurns = new Map<string, { timer: NodeJS.Timeout; texts: string[] }>
 // is mid-flight. The lock guarantees ONE turn at a time per lead; fragments
 // that arrive during a turn wait and get answered in the NEXT single turn.
 const activeTurns = new Set<string>();
+
+// Stale-turn guard: activeTurns stops a PARALLEL turn, but not a stale
+// SEQUENTIAL one — a fragment can land while the brain call (8-15s with the
+// current model) is already in flight, after entry.texts was captured. Without
+// this, the in-flight reply gets sent anyway (answering content the lead has
+// since added to), immediately followed by a second turn/reply for the new
+// message. Counts consecutive discards per lead so a lead typing continuously
+// still gets answered rather than being discarded forever.
+const staleReruns = new Map<string, number>();
+const MAX_STALE_RERUNS = 2;
 
 const FALLBACK_REPLY = 'Thanks for your message! One of our counsellors will get back to you shortly. 🙏';
 
@@ -301,16 +315,39 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
       return;
     }
 
-    const combined = entry.texts.join('\n');
     const history = await db.getConversation(lead.id);
     const prior = history.slice(0, Math.max(0, history.length - entry.texts.length));
 
-    const result = await runBrain(tenant, lead, prior, combined);
+    // Fix 3: pass the individual fragments, not a joined string — runBrain
+    // frames >1 message explicitly as "N messages, answer all of them" so a
+    // quick burst gets one reply that addresses everything, not just the first.
+    const result = await runBrain(tenant, lead, prior, entry.texts);
+
+    // Stale-turn check: did new inbound text arrive while the brain call was
+    // in flight? If so this reply would answer content the lead has already
+    // added to — discard it (never send, never write) and let the next turn
+    // answer everything together instead of sending twice.
+    const arrivedDuringTurn = pendingTurns.get(leadId)?.texts.length ?? 0;
+    if (arrivedDuringTurn > 0) {
+      const reruns = staleReruns.get(leadId) ?? 0;
+      if (reruns < MAX_STALE_RERUNS) {
+        staleReruns.set(leadId, reruns + 1);
+        // Restore full chronological order: this turn's texts, then whatever
+        // arrived during it. maybeRunTurn's finally-block re-debounces and
+        // re-runs the turn on the combined set once this one releases.
+        pendingTurns.get(leadId)!.texts.unshift(...entry.texts);
+        console.log(`[engine] stale turn for ${leadId}, re-running with ${arrivedDuringTurn} queued message(s)`);
+        return;
+      }
+      // A lead typing continuously must still get an answer — stop discarding.
+      staleReruns.delete(leadId);
+    }
 
     if (!result) {
       // Safety net: never ghost a lead if the brain fails or returns garbage.
       await sendReply(tenant, lead, FALLBACK_REPLY);
       replied = true;
+      staleReruns.delete(leadId);
       await alertOperator(tenant, 'brain_failed', `brain returned nothing usable for ${lead.phone}; sent fallback`, lead.id, 'warn');
       return;
     }
@@ -329,6 +366,7 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     // never stand between the lead and a reply.
     await sendReply(tenant, lead, safe);
     replied = true;
+    staleReruns.delete(leadId);
 
     if (flagged) {
       await alertOperator(tenant, 'reply_flagged', `guard replaced risky reply: "${result.reply}"`, lead.id, 'warn');
