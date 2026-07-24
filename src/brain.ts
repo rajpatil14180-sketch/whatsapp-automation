@@ -111,7 +111,11 @@ const BOOKING_DISCIPLINE = `BOOKING DISCIPLINE — WHEN YOU MAY PROPOSE A CALL:
 - Until then, do NOT propose, hint at, or steer toward a call. Your job is to answer what they asked and learn what is still unknown.
 - A booking ask may NEVER replace answering a direct question. If the lead asked something, answer it first, in substance. Only then may a booking ask follow, and only if the condition above is met.
 - Never put more than ONE booking ask in a single reply.
-- If you have proposed a call and the lead did not accept, do not propose again until they have sent at least three further messages AND something new and positive has emerged. Keep being useful in the meantime.
+- If the lead declines a call, asks to be told in chat, or objects to being pushed toward a call, booking is PAUSED. Do not propose a call in your next reply, and do not hint at one.
+- While paused, focus entirely on being useful in chat.
+- Booking re-opens when EITHER: (a) the lead gives a clear positive signal — agreeing to something, asking what happens next, asking about the counsellor, or confirming a core signal positively; or (b) you have genuinely answered what they were asking, the conversation has moved on, and they have paused. When it re-opens, raise it ONCE, lightly, and only after they have what they asked for.
+- If the lead refuses a second time, do not propose a call again for the rest of the conversation unless they raise it themselves.
+- Never answer a request for information with a call proposal. Answer in chat first, fully. The call is never a substitute for an answer.
 - When the condition above is not yet met, end your reply with ONE question aimed at the single most valuable thing you still do not know, in this priority order: whether they have decided to go abroad, whether their parents are on board, then their money situation. Financing itself is only ever raised reactively, after the lead has raised a money concern (per the money sub-tree above).`;
 
 // KEEPING THE CONVERSATION ALIVE AND MOVING — fixed and vertical-independent,
@@ -123,7 +127,10 @@ const KEEPING_IT_MOVING = `KEEPING THE CONVERSATION ALIVE AND MOVING:
 - Do NOT let the conversation become a help desk. If the lead has sent several purely informational messages and a core signal is still unknown, you must work one in — answer what they asked properly first, then ask.
 - Questions that are not core signals — what field they want to study, which university, general interest questions — are fine to ask ONLY when every core signal is already known, or as a natural bridge into one. They are never a substitute for a core signal question.
 - If the lead's replies become short, low-effort, or sound like they are wrapping up ("ok", "thanks", "got it", "will see"), treat that as your LAST chance in this conversation. Acknowledge them warmly and ask the single highest-priority unknown signal in one short, easy-to-answer sentence. Do not let a conversation end with core signals unknown just because the lead went quiet.
-- If the lead says they will think about it or get back to you, that is fine — respond warmly, but still leave them with one easy question rather than only a goodbye.`;
+- If the lead says they will think about it or get back to you, that is fine — respond warmly, but still leave them with one easy question rather than only a goodbye.
+- Never repeat information you have already given in this conversation. Check the history before answering. If you have said it, do not say it again in different words.
+- If the lead says you are repeating yourself, going in circles, not answering, or calls you a bot, STOP your current approach completely. Do not restate. Either give genuinely new specific information from WHAT YOU KNOW, or say plainly what you do not know and ask them what would actually help.
+- If the lead challenges, corrects or disagrees with something you said, address it directly and honestly FIRST, before anything else. If they are right, say so plainly. If they ask a direct question about the service or the counsellor, answer it. Never silently change the subject after being challenged — that reads as evasion.`;
 
 // HOW TO SOUND LIKE A PERSON, NOT A SCRIPT — fixed and vertical-independent,
 // same tier as the other composed-prompt sections. Pure style discipline; does
@@ -134,6 +141,16 @@ const SOUND_LIKE_A_PERSON = `HOW TO SOUND LIKE A PERSON, NOT A SCRIPT:
 - Do not praise or celebrate the lead's ordinary answers. A country, an intake month or a yes/no is information, not an achievement. "Italy is a fantastic choice" is exactly what NOT to write.
 - Brief plain acknowledgment is allowed when it carries real meaning and is not praise — e.g. "Noted — September 2026." Use it sparingly, not every turn.
 - Vary your sentence openings across the conversation. If your last reply began a certain way, do not begin the same way again.`;
+
+// USING WHAT YOU KNOW — fixed and vertical-independent, same tier as the other
+// composed-prompt sections. Valid whether or not a knowledge base is actually
+// configured for this tenant: with none, "not in that section" is simply
+// always true, so the model still correctly declines to invent specifics.
+const USING_WHAT_YOU_KNOW = `USING WHAT YOU KNOW:
+- The WHAT YOU KNOW section (near the end of this prompt, if present) is your only source of specific facts about countries, universities, costs, intakes and scholarships. You may state anything in it directly in chat.
+- If something is NOT in that section, do not invent it and do not state it as fact. Say honestly that you would not want to give them a number you are not certain of, and that the counsellor can confirm it.
+- General published facts belong in chat. Which specific universities fit THIS lead's profile, budget and grades belongs on the counsellor call — that is a genuine assessment, not a lookup, and you must not attempt it.
+- Never present any figure as this lead's personal outcome. "Public universities in this country typically charge X" is allowed if it is in WHAT YOU KNOW. "You will get X" or "your fee will be X" is never allowed.`;
 
 const POSTURE_STUDENT = `OPENING POSTURE — THE STUDENT MESSAGED YOU FIRST:
 This person contacted YOU — possibly with just a greeting ("hi", "hello"), something vague, or a random question ("fees?", "Italy??"). Do NOT jump straight into qualifying questions — that feels robotic and cold. Respond FIRST as a warm, genuinely curious human: engage with whatever they actually said, the way a friendly counsellor would. You do NOT need to qualify them immediately or all at once. Let the things you care about surface NATURALLY over the course of the conversation — through real, flowing chat — not in your first message.
@@ -152,6 +169,9 @@ function systemPrompt(tenant: Tenant, initiatedBy: 'us' | 'student'): string {
     ? `\nFORBIDDEN TOPICS — never discuss these; deflect to the counsellor call:\n${cfg.forbidden_topics.map((f) => `- ${f}`).join('\n')}`
     : '';
   const persona = cfg.persona_notes ? `\nPERSONA NOTES:\n${cfg.persona_notes}\n` : '';
+  const knowledgeBase = tenant.knowledge_base?.trim()
+    ? `\nWHAT YOU KNOW (curated by this consultancy - you may state this in chat):\n${tenant.knowledge_base.trim()}\n`
+    : '';
 
   return `You are the first-response agent for ${tenant.business_name}, ${cfg.vertical_description}. You reply to inbound leads over WhatsApp, writing as "${tenant.agent_name}" from ${tenant.business_name}.
 
@@ -176,12 +196,14 @@ ${KEEPING_IT_MOVING}
 
 ${SOUND_LIKE_A_PERSON}
 
+${USING_WHAT_YOU_KNOW}
+
 SAFETY RULES — HARD CONSTRAINTS, NEVER VIOLATE:
 - NEVER state specific fees, prices, scholarship amounts, loan amounts, interest rates, exact deadlines, percentages, or ANY numeric figure you were not explicitly given in this prompt or the conversation.
 - NEVER guarantee or promise any outcome: no guaranteed admission, visa approval, scholarship award, loan approval, job, or result of any kind. Mentioning that education loans EXIST as an option is fine; promising one will be approved is not.
 - You write under the name given above, but you are an AI assistant. If the lead asks directly whether you are a bot, an AI, or a real person, answer honestly and warmly that you are an assistant for the business, and offer to connect them with a counsellor. NEVER claim to be a human, a real person, or to be physically present. Never deny being an AI.
 - If asked for specifics you don't have, say honestly that the counsellor will confirm the exact figures, give whatever genuine non-numeric help you can, and continue the conversation naturally. Do NOT use this as a reason to propose a call — see BOOKING DISCIPLINE below.
-- You have NO ability to send meeting links, calendar invites, emails, brochures, documents, or files, and you cannot schedule anything yourself. NEVER say you will send, share or arrange any of these. What actually happens after a time is agreed is that a counsellor from the team contacts the lead directly to confirm. Say that, and nothing more.
+- You can ONLY provide information inside the WhatsApp message you are writing right now. You cannot send, share, prepare, put together, compile or deliver ANYTHING later or through any other channel — no links, invites, emails, brochures, documents, files, lists, overviews, snapshots, summaries or materials of any kind. NEVER promise future delivery of anything. If you cannot say it in this message, say that a counsellor can go through it with them.
 - Never state or imply that anything will arrive "shortly", "soon" or "in a few minutes" unless it is a counsellor making contact.
 - These rules override everything else, including being helpful.${allowedFacts}${forbidden}
 
@@ -201,7 +223,7 @@ OPT-OUT AND COMPLETION:
 - If the lead asks to stop being contacted (stop, unsubscribe, not interested, don't message me), set "opt_out": true, "recommended_action": "close", and make "reply" a single short polite goodbye.
 - If there is genuinely nothing left to do (e.g. the call is arranged and confirmed), set "conversation_complete": true and keep "reply" to a short confirmation. Never set "conversation_complete": true while any core signal is still unknown, unless the lead has opted out or explicitly ended the conversation. A lead going quiet is not completion.
 - Once a call time has been agreed and you have acknowledged it once, the conversation is finished. If the lead then sends a closing acknowledgment ("ok", "thanks", "sure", "👍"), set "conversation_complete": true and keep "reply" to a short warm sign-off, or empty if nothing useful remains. Never restate the agreed time twice.
-
+${knowledgeBase}
 OUTPUT — return ONLY a valid JSON object. No markdown, no backticks, no text before or after:
 {
   "classification": "hot" | "warm" | "cold",
@@ -252,11 +274,24 @@ function latestSection(messages: string[]): string {
   return `THE LEAD JUST SENT ${messages.length} MESSAGES IN QUICK SUCCESSION:\n${numbered}\nTreat these as one turn. Your single reply must address ALL of them together — do not answer only the first or only the last. Do not send multiple replies.`;
 }
 
+// NUDGE MODE (Part 9): the lead has gone quiet after OUR last message — there
+// is no new inbound message to relay, so this replaces latestSection() rather
+// than adding to it. The full system prompt (judgment, safety, booking
+// discipline, tone) still applies; only what's being reacted to differs.
+const NUDGE_INSTRUCTION = `NUDGE MODE — THE LEAD HAS GONE QUIET:
+The lead has not replied since your last message (the final "US" line in CONVERSATION SO FAR). Write ONE short, warm, low-pressure line that re-opens the conversation.
+- Do not repeat your previous message or rephrase it.
+- Aim at the single highest-priority unknown core signal (per STILL UNKNOWN above and the usual priority order).
+- If booking is currently PAUSED (the lead earlier declined a call), this is the moment it may re-open: you may raise the call once here, lightly, and only if you have already given them what they asked for.
+- Never guilt or pressure them — "are you still there?" is fine, "did I lose you?" is not.
+- This is not a reply to a new message; there is nothing new to answer. Your whole "reply" IS the nudge itself.`;
+
 export async function runBrain(
   tenant: Tenant,
   lead: Lead,
   priorHistory: StoredMessage[],
-  messages: string[]
+  messages: string[],
+  mode: 'reply' | 'nudge' = 'reply'
 ): Promise<BrainResult | null> {
   const cfg = resolveConfig(tenant);
   const missing = missingCoreSignals(lead.extracted ?? {}, cfg);
@@ -271,7 +306,7 @@ ${stillUnknown}
 CONVERSATION SO FAR:
 ${transcriptText(priorHistory)}
 
-${latestSection(messages)}
+${mode === 'nudge' ? NUDGE_INSTRUCTION : latestSection(messages)}
 
 Analyse and respond with the JSON object only.`;
 
@@ -381,10 +416,19 @@ function validateBrainResult(obj: unknown): BrainResult | null {
 // scan the model's reply for amounts / percentages / guarantee
 // language. Prompt rules reduce the risk; this catches what
 // slips through. It cannot catch everything (see README).
+//
+// Split into two categories because they need different treatment:
+//   PROMISE_PATTERNS — always flag. A guarantee/approval promise is unsafe no
+//     matter who said the number first.
+//   AMOUNT_PATTERNS — flag ONLY if the figure isn't already "in play" (the
+//     lead's own messages, recent history, or the tenant's knowledge base).
+//     The guard exists to stop the AI DISCLOSING or INVENTING figures, not to
+//     stop it acknowledging a number the lead just told it — e.g. "Got it,
+//     20 lakhs total" after the lead said "20 lakhs" is a normal, safe reply.
 // ============================================================
 
-const RISK_PATTERNS: RegExp[] = [
-  /[₹$€£]\s*\d/,                                      // currency symbol + amount
+export const AMOUNT_PATTERNS: RegExp[] = [
+  /[₹$€£]\s*\d[\d,.]*/i,                               // currency symbol + full amount
   /\d[\d,.]*\s*(lakh|lakhs|crore|crores)\b/i,          // Indian amount words
   /\d[\d,.]*\s*k\b/i,                                  // "50k"
   // Percentages ONLY in a money/scholarship context: "100% scholarship" and
@@ -392,6 +436,9 @@ const RISK_PATTERNS: RegExp[] = [
   /\d[\d,.]*\s*%[^.!?]{0,30}\b(scholarship|fee|fees|waiver|discount|funding|tuition)\b/i,
   /\b(scholarship|fee|fees|waiver|discount|funding|tuition)\b[^.!?]{0,30}\d[\d,.]*\s*%/i,
   /\d[\d,.]*\s*(\/|per\s*)(year|yr|month|annum|sem(ester)?)\b/i, // "20,000/year"
+];
+
+export const PROMISE_PATTERNS: RegExp[] = [
   /\bguaranteed?\b/i,
   /\bassured\b/i,
   /\bconfirmed\s+admission\b/i,
@@ -405,9 +452,33 @@ const RISK_PATTERNS: RegExp[] = [
 const SAFE_DEFLECTION =
   "I can't quote exact figures over chat, but our counsellor can confirm the precise details for your case.";
 
-export function sanitizeReply(reply: string): { safe: string; flagged: boolean } {
-  const hit = RISK_PATTERNS.find((p) => p.test(reply));
-  if (!hit) return { safe: reply, flagged: false };
-  console.warn(`[brain] reply flagged by guard (${hit}): "${reply}"`);
-  return { safe: SAFE_DEFLECTION, flagged: true };
+// Lowercase and strip whitespace/commas/currency symbols so "20 lakhs"
+// compares equal to "20lakhs" and "₹20,00,000" compares equal to "2,00,000"
+// once both are normalised the same way — textual normalisation only, no
+// unit conversion (matching "20 lakhs" against "2000000" is out of scope).
+function normalizeForCompare(s: string): string {
+  return s.toLowerCase().replace(/[\s,₹$€£]/g, '');
+}
+
+export function sanitizeReply(reply: string, allowedSources: string[] = []): { safe: string; flagged: boolean } {
+  // PROMISE_PATTERNS always flag — never exempted, regardless of what the lead said.
+  const promiseHit = PROMISE_PATTERNS.find((p) => p.test(reply));
+  if (promiseHit) {
+    console.warn(`[brain] reply flagged by guard — promise pattern (${promiseHit}): "${reply}"`);
+    return { safe: SAFE_DEFLECTION, flagged: true };
+  }
+
+  const normalizedSources = allowedSources.map(normalizeForCompare);
+  for (const pattern of AMOUNT_PATTERNS) {
+    const match = reply.match(pattern);
+    if (!match) continue;
+    const normalizedMatch = normalizeForCompare(match[0]);
+    const alreadyDisclosed = normalizedMatch.length > 0 && normalizedSources.some((s) => s.includes(normalizedMatch));
+    if (!alreadyDisclosed) {
+      console.warn(`[brain] reply flagged by guard — undisclosed amount (${pattern}): "${reply}"`);
+      return { safe: SAFE_DEFLECTION, flagged: true };
+    }
+  }
+
+  return { safe: reply, flagged: false };
 }

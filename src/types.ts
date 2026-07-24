@@ -36,6 +36,17 @@ export interface Tenant {
   // Migration 003 — profile-based opener selection; first matching rule wins,
   // else wa_opening_template. Every referenced template must be Meta-approved.
   opener_rules: OpenerRule[];
+
+  // Migration 005 — curated factual content the AI may state directly in
+  // chat (published fees/tuition ranges, intakes, scholarship programs...).
+  // Nullable; empty/missing means the brain has no specifics to draw on.
+  knowledge_base?: string | null;
+
+  // Migration 006 — quiet hours for PROACTIVE messages only (stall nudge,
+  // scheduler follow-ups) — never affects replying to an inbound message.
+  timezone: string;          // IANA name, e.g. 'Asia/Kolkata'
+  quiet_hours_start: number; // local hour 0-23, inclusive; window wraps midnight if > end
+  quiet_hours_end: number;   // local hour 0-23, exclusive
 }
 
 export interface OpenerRule {

@@ -189,6 +189,33 @@ alter table tenants add column if not exists opener_rules jsonb not null default
 -- that the one alert has been sent.
 alter table leads add column if not exists hot_alerted boolean not null default false;
 
+-- ============================================================
+-- MIGRATION 005 — tenant knowledge base.
+-- Append-only: safe to run on an existing database.
+-- ============================================================
+
+-- Curated factual content (published fees/tuition ranges, intakes, scholarship
+-- programs, etc.) that the AI may state directly in chat. Nullable — leads are
+-- handled exactly as before if left unset (the brain simply has no specifics
+-- to draw on and defers numbers to the counsellor). Anything in here is also
+-- treated as guard-allowed by sanitizeReply's amount check (see brain.ts).
+alter table tenants add column if not exists knowledge_base text;
+
+-- ============================================================
+-- MIGRATION 006 — tenant quiet hours.
+-- Append-only: safe to run on an existing database.
+-- ============================================================
+
+-- Local timezone + quiet-hours window used to hold back low-value PROACTIVE
+-- messages (the in-conversation stall nudge in engine.ts, and follow-up
+-- templates in scheduler.ts) so nothing fires overnight in the tenant's own
+-- local time. Does NOT affect replying to an inbound message — only things
+-- WE initiate. quiet_hours_start/end are local hours (0-23); the window wraps
+-- midnight when start > end (default 21 -> 09, i.e. 9pm-9am is quiet).
+alter table tenants add column if not exists timezone text not null default 'Asia/Kolkata';
+alter table tenants add column if not exists quiet_hours_start int not null default 21;
+alter table tenants add column if not exists quiet_hours_end int not null default 9;
+
 -- ------------------------------------------------------------
 -- Example: register your first client. Fill in the real values.
 -- ------------------------------------------------------------

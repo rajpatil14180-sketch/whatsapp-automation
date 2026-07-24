@@ -1,7 +1,7 @@
 import * as db from './db';
 import * as wa from './whatsapp';
 import { alertOperator } from './operator';
-import { computeNoreplyFollowupAt, computeStalledFollowupAt, tenantTemplateBudgetOk, noteTemplateSent } from './engine';
+import { computeNoreplyFollowupAt, computeStalledFollowupAt, tenantTemplateBudgetOk, noteTemplateSent, isQuietHours } from './engine';
 import { config } from './config';
 
 // ============================================================
@@ -40,6 +40,16 @@ export async function sweepFollowups(): Promise<void> {
 
   for (const lead of due) {
     const tenant = lead.tenant;
+
+    // Quiet hours (9e): unlike the in-conversation stall nudge, a follow-up
+    // template is not time-critical the same way — defer rather than drop.
+    // Leave next_followup_at untouched so this lead is simply picked up again
+    // on the next sweep (2 min later), retrying until quiet hours end.
+    if (isQuietHours(tenant)) {
+      console.log(`[scheduler] quiet hours for ${tenant.name} — deferring ${lead.track} follow-up to ${lead.phone}`);
+      continue;
+    }
+
     const isStalled = lead.track === 'stalled';
 
     // Pick the track's template list / counter / cap.

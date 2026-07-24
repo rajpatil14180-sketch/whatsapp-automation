@@ -158,12 +158,96 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
 
 // P1-5: rapid-fire messages ("hi" / "you there?" / "hello?") coalesce into ONE
 // brain run per quiet period. In-memory + single-instance — see README.
-// Trade-off: higher = better coalescing of slow typing bursts (people often
-// pause 4-6s between WhatsApp fragments), at the cost of a slightly slower
-// first reply. 7s was chosen after live testing showed 4s split real bursts
-// into separate turns.
-const DEBOUNCE_MS = 7000;
-const pendingTurns = new Map<string, { timer: NodeJS.Timeout; texts: string[] }>();
+//
+// ADAPTIVE DEBOUNCE (Part 7): a single fixed wait treats a complete question
+// and a one-word fragment the same. WhatsApp delivers no typing-indicator
+// webhook, so this can only be driven by message CONTENT and ARRIVAL, never
+// typing state. debounceForText() picks the quiet period per message:
+//   SHORT  — reads as a complete question/thought: reply almost immediately.
+//   LONG   — reads as a fragment (still typing): give them room to continue.
+//   NORMAL — everything else.
+// Every new message re-clears and restarts the timer using ITS OWN
+// classification, so the wait is always recomputed from the LATEST message —
+// deliberately NO time ceiling: if the lead keeps typing, keep waiting, since
+// someone still typing does not want an answer yet. MAX_PENDING_MESSAGES is
+// the only cap, and it exists purely as a volume safety valve against a
+// spammer or broken client, not against normal typing.
+export const DEBOUNCE_SHORT_MS = 2500;
+export const DEBOUNCE_LONG_MS = 14000;
+export const DEBOUNCE_NORMAL_MS = 7000;
+const MAX_PENDING_MESSAGES = 12;
+
+const INTERROGATIVE_WORDS = new Set([
+  'what', 'how', 'which', 'when', 'where', 'why', 'who',
+  'can', 'could', 'do', 'does', 'is', 'are', 'should', 'will',
+]);
+
+// Returns the quiet period to use for a just-arrived message.
+export function debounceForText(text: string): number {
+  const trimmed = text.trim();
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+  const firstWord = (words[0] ?? '').toLowerCase().replace(/[^a-z']/g, '');
+
+  const endsInQuestionMark = trimmed.endsWith('?');
+  const interrogativeOpener = INTERROGATIVE_WORDS.has(firstWord) && wordCount >= 4;
+  const isLong = wordCount >= 25;
+  if (endsInQuestionMark || interrogativeOpener || isLong) return DEBOUNCE_SHORT_MS;
+
+  const endsWithTerminalPunctuation = /[.!?]$/.test(trimmed);
+  if (wordCount <= 3 && !endsWithTerminalPunctuation) return DEBOUNCE_LONG_MS;
+
+  return DEBOUNCE_NORMAL_MS;
+}
+
+interface PendingEntry {
+  timer: NodeJS.Timeout;
+  texts: string[];
+}
+const pendingTurns = new Map<string, PendingEntry>();
+
+// Reschedules entry.timer — the single place that applies the adaptive delay
+// and the volume safety valve, used both when a new fragment arrives and when
+// a completed turn re-debounces leftover texts. Delay is always computed from
+// the LAST (most recent) text in the batch.
+function scheduleTurn(tenant: Tenant, leadId: string, entry: PendingEntry): void {
+  clearTimeout(entry.timer);
+
+  if (entry.texts.length >= MAX_PENDING_MESSAGES) {
+    console.warn(`[engine] pending batch for ${leadId} reached MAX_PENDING_MESSAGES (${MAX_PENDING_MESSAGES}); firing turn immediately`);
+    entry.timer = setTimeout(() => {
+      maybeRunTurn(tenant, leadId).catch((e) => console.error('[engine] turn error', e));
+    }, 0);
+    return;
+  }
+
+  const delay = debounceForText(entry.texts[entry.texts.length - 1] ?? '');
+  entry.timer = setTimeout(() => {
+    maybeRunTurn(tenant, leadId).catch((e) => console.error('[engine] turn error', e));
+  }, delay);
+}
+
+// ============================================================
+// QUIET HOURS (Part 9e): holds back PROACTIVE messages only (the
+// in-conversation stall nudge below, and scheduler.ts follow-ups) — never
+// affects replying to an inbound message. Wraps midnight when
+// quiet_hours_start > quiet_hours_end (default 21 -> 9, i.e. 9pm-9am).
+// ============================================================
+export function isQuietHours(tenant: Tenant, at: Date = new Date()): boolean {
+  const tz = tenant.timezone || 'Asia/Kolkata';
+  let hour: number;
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: 'numeric', hourCycle: 'h23' }).formatToParts(at);
+    hour = parseInt(parts.find((p) => p.type === 'hour')?.value ?? '0', 10);
+  } catch (e) {
+    console.warn(`[engine] invalid tenant timezone "${tz}"; quiet-hours check skipped`, e);
+    return false;
+  }
+  const start = tenant.quiet_hours_start ?? 21;
+  const end = tenant.quiet_hours_end ?? 9;
+  if (start === end) return false; // zero-width window disables quiet hours
+  return start < end ? (hour >= start && hour < end) : (hour >= start || hour < end);
+}
 
 // Fix 3: per-lead turn lock. WhatsApp users type in fragments and brain
 // latency (2–5s) can exceed the debounce, so a fragment can land while a turn
@@ -181,7 +265,49 @@ const activeTurns = new Set<string>();
 const staleReruns = new Map<string, number>();
 const MAX_STALE_RERUNS = 2;
 
+// How many recent inbound messages count as "already in play" for the amount
+// guard (sanitizeReply) — enough to cover a figure the lead mentioned a
+// couple of turns ago without scanning the whole conversation.
+const RECENT_INBOUND_FOR_GUARD = 5;
+
 const FALLBACK_REPLY = 'Thanks for your message! One of our counsellors will get back to you shortly. 🙏';
+
+// ============================================================
+// QUIET MID-CONVERSATION NUDGE (Part 9). In-process setTimeout, same
+// in-memory/single-instance pattern as pendingTurns/activeTurns above —
+// deliberately NOT in scheduler.ts or the DB (see README residual risks).
+// This is distinct from the Track B stalled-follow-up template: that's a
+// long-horizon (hours/days) paid template for a lead that never resumed
+// after the window closed; this is a same-conversation, free-text, one-shot
+// check-in fired 2 minutes after OUR message if they go quiet mid-chat.
+// ============================================================
+const STALL_NUDGE_MS = 120000;
+const stallTimers = new Map<string, NodeJS.Timeout>();
+// One nudge per lead, ever (in-memory only — resets on restart, an accepted
+// limitation of the in-process approach specified for this feature).
+const stallNudgeSent = new Set<string>();
+
+function clearStallTimer(leadId: string): void {
+  const t = stallTimers.get(leadId);
+  if (t) {
+    clearTimeout(t);
+    stallTimers.delete(leadId);
+  }
+}
+
+// Start/restart the stall timer — called after a reply is successfully sent.
+function startOrRestartStallTimer(tenant: Tenant, lead: Lead): void {
+  clearStallTimer(lead.id);
+  const timer = setTimeout(() => {
+    maybeFireStallNudge(tenant, lead.id).catch((e) => console.error('[engine] stall nudge error', e));
+  }, STALL_NUDGE_MS);
+  stallTimers.set(lead.id, timer);
+}
+
+// The lead's last message signalled they'll act on their own and come back —
+// nudging here would read as impatient, not helpful.
+const AWAY_INTENT_RE =
+  /\b(i'?ll\s+(ask|check|think|talk|see|discuss)|let\s+me\s+(think|check|see|ask)|will\s+get\s+back|get\s+back\s+to\s+you|talk\s+(to\s+you\s+)?later|call\s+(you\s+)?(back|later)|will\s+(think|check|ask)|need\s+to\s+(think|check|ask|discuss))\b/i;
 
 // One runaway_check ping per lead per process — a hot lead past the runaway
 // cap keeps being served; the operator just gets told once to glance at it.
@@ -217,6 +343,10 @@ export async function handleInboundMessage(
     return;
   }
 
+  // Part 9b: any genuine inbound message means the lead is not "gone quiet" —
+  // cancel any pending stall nudge, whatever the message says.
+  clearStallTimer(lead.id);
+
   // Opted-out leads are stored (for the record) but never processed or replied to.
   if (lead.opted_out) return;
 
@@ -240,11 +370,8 @@ export async function handleInboundMessage(
 
   // Debounce: (re)start the quiet-period timer for this lead.
   const entry = pendingTurns.get(lead.id) ?? { timer: setTimeout(() => {}, 0), texts: [] };
-  clearTimeout(entry.timer);
   entry.texts.push(text);
-  entry.timer = setTimeout(() => {
-    maybeRunTurn(tenant, lead!.id).catch((e) => console.error('[engine] turn error', e));
-  }, DEBOUNCE_MS);
+  scheduleTurn(tenant, lead.id, entry);
   pendingTurns.set(lead.id, entry);
 }
 
@@ -263,10 +390,7 @@ async function maybeRunTurn(tenant: Tenant, leadId: string): Promise<void> {
     // Fragments that arrived mid-turn: give them a fresh quiet period, then run.
     const entry = pendingTurns.get(leadId);
     if (entry && entry.texts.length) {
-      clearTimeout(entry.timer);
-      entry.timer = setTimeout(() => {
-        maybeRunTurn(tenant, leadId).catch((e) => console.error('[engine] turn error', e));
-      }, DEBOUNCE_MS);
+      scheduleTurn(tenant, leadId, entry);
     }
   }
 }
@@ -301,6 +425,7 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
         }
       } else {
         await db.setHumanHandoff(lead.id, true);
+        clearStallTimer(lead.id);
         await alertOperator(tenant, 'runaway_stop',
           `lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages without becoming hot — auto-reply stopped as a cost/safety stop, human handoff`,
           lead.id, 'warn');
@@ -331,6 +456,7 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     const fresh = await db.getLeadById(leadId);
     if (!fresh || fresh.opted_out || fresh.human_handoff) {
       staleReruns.delete(leadId);
+      clearStallTimer(leadId);
       console.log(`[engine] lead ${leadId} opted out or handed off mid-turn; discarding reply`);
       return;
     }
@@ -367,18 +493,28 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     // P2-9: the brain detected stop intent the keyword filter missed.
     if (result.opt_out) {
       await db.markOptedOut(lead.id);
+      clearStallTimer(leadId);
       await alertOperator(tenant, 'lead_opted_out', `${lead.name ?? lead.phone} opted out (brain-detected)`, lead.id, 'info');
       return;
     }
 
-    // P0-3: output guard — never let amounts/guarantees reach the lead.
-    const { safe, flagged } = sanitizeReply(result.reply);
+    // P0-3: output guard — never let INVENTED amounts/guarantees reach the
+    // lead. Amounts already "in play" are exempt from the amount check (but
+    // never the promise check): this turn's own messages, a few recent
+    // inbound messages, and the tenant's curated knowledge base.
+    const recentInbound = prior.filter((m) => m.direction === 'in').slice(-RECENT_INBOUND_FOR_GUARD).map((m) => m.body ?? '');
+    const allowedSources = [...entry.texts, ...recentInbound, ...(tenant.knowledge_base ? [tenant.knowledge_base] : [])];
+    const { safe, flagged } = sanitizeReply(result.reply, allowedSources);
 
     // Answer the student FIRST; everything below is bookkeeping that must
     // never stand between the lead and a reply.
     await sendReply(tenant, lead, safe);
     replied = true;
     staleReruns.delete(leadId);
+    // Part 9b: this reply may ask something — start the 2-minute quiet-mid-
+    // conversation check. (If we're about to close the lead below, that path
+    // clears it again immediately after — harmless, keeps this ordering simple.)
+    startOrRestartStallTimer(tenant, lead);
 
     if (flagged) {
       await alertOperator(tenant, 'reply_flagged', `guard replaced risky reply: "${result.reply}"`, lead.id, 'warn');
@@ -389,8 +525,10 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     // P2-9: conversation completion.
     if (result.recommended_action === 'close') {
       await db.closeLead(lead.id, 'closed', 'not_interested');
+      clearStallTimer(leadId);
     } else if (result.conversation_complete) {
       await db.closeLead(lead.id, 'booked', 'booked');
+      clearStallTimer(leadId);
     }
 
     // Route hot leads: the counsellor gets the BOOKING (summary + proposed
@@ -409,6 +547,7 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     if (result.needs_human && result.classification !== 'hot') {
       const reason = result.needs_human_reason || 'unspecified';
       await db.setHumanHandoff(lead.id, true);
+      clearStallTimer(leadId);
       await alertOperator(tenant, 'needs_human',
         `AI escalated ${lead.name ?? lead.phone} (reason: ${reason}) — take over the chat: https://wa.me/${lead.phone}`,
         lead.id, 'warn');
@@ -431,6 +570,50 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
         `turn for ${lead.name ?? lead.phone} threw ${replied ? 'AFTER the reply was sent (state writes may be incomplete)' : 'before any reply (fallback attempted)'}: ${e instanceof Error ? e.message : String(e)}`,
         lead.id, 'error');
     } catch (e3) { console.error('[engine] turn_error alert failed', e3); }
+  }
+}
+
+// Part 9c: fires ~2 minutes after our last reply if the lead has gone quiet.
+// Every gate below must hold, or the nudge is skipped entirely (never
+// deferred — a 2-minute check-in delivered late defeats its own purpose).
+async function maybeFireStallNudge(tenant: Tenant, leadId: string): Promise<void> {
+  stallTimers.delete(leadId); // this timer has fired; it's spent either way
+
+  const fresh = await db.getLeadById(leadId);
+  if (!fresh || fresh.opted_out || fresh.human_handoff) return;
+  if (fresh.status === 'booked' || fresh.status === 'closed') return;
+  if (stallNudgeSent.has(leadId)) return;
+  if (!wa.canSendFreeText(fresh.last_inbound_at)) return; // free text only, never a template
+  if (isQuietHours(tenant)) return; // dropped entirely, not deferred
+
+  const history = await db.getConversation(leadId);
+  if (!history.length) return;
+  const lastOutbound = [...history].reverse().find((m) => m.direction === 'out');
+  const lastInbound = [...history].reverse().find((m) => m.direction === 'in');
+
+  // Gate: our last message must have actually asked something — nothing to
+  // chase otherwise.
+  if (!lastOutbound?.body || !lastOutbound.body.includes('?')) return;
+
+  // Gate: the lead's last message must not have signalled they'll act and
+  // come back on their own ("I'll ask my parents", "let me think"...).
+  if (lastInbound?.body && AWAY_INTENT_RE.test(lastInbound.body)) return;
+
+  const result = await runBrain(tenant, fresh, history, [], 'nudge');
+  if (!result) return; // no nudge this time is fine — they already have our last message, unlike a ghosted reply
+
+  const recentInbound = history.filter((m) => m.direction === 'in').slice(-RECENT_INBOUND_FOR_GUARD).map((m) => m.body ?? '');
+  const allowedSources = [...recentInbound, ...(tenant.knowledge_base ? [tenant.knowledge_base] : [])];
+  const { safe } = sanitizeReply(result.reply, allowedSources);
+
+  const r = await wa.sendText(tenant, fresh.phone, safe);
+  if (r.id) {
+    stallNudgeSent.add(leadId);
+    await db.appendMessage(leadId, { direction: 'out', body: safe }, r.id);
+    await db.markOutboundContact(leadId, computeStalledFollowupAt(tenant, fresh.stalled_followups_sent ?? 0));
+    console.log(`[engine] stall nudge sent to ${fresh.phone}`);
+  } else {
+    console.warn(`[engine] stall nudge send failed for ${fresh.phone}: [${r.error?.code ?? '?'}] ${r.error?.message ?? 'unknown'}`);
   }
 }
 

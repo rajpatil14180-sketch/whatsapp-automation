@@ -35,6 +35,10 @@ function hydrateTenant(row: any): Tenant {
   t.stalled_max_followups = row.stalled_max_followups ?? 2;
 
   t.opener_rules = (row.opener_rules as Tenant['opener_rules'] | null) ?? [];
+
+  t.timezone = row.timezone || 'Asia/Kolkata';
+  t.quiet_hours_start = row.quiet_hours_start ?? 21;
+  t.quiet_hours_end = row.quiet_hours_end ?? 9;
   return t;
 }
 
