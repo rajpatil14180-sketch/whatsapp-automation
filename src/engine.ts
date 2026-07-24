@@ -323,6 +323,18 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     // quick burst gets one reply that addresses everything, not just the first.
     const result = await runBrain(tenant, lead, prior, entry.texts);
 
+    // Opt-out / handoff can land while the brain call was in flight —
+    // handleInboundMessage handles those and returns before ever touching
+    // pendingTurns, so the stale-turn check below can't see them. Re-fetch and
+    // abort outright (never send/write) rather than re-run: unlike a stray
+    // fragment, this lead should not be auto-replied to at all right now.
+    const fresh = await db.getLeadById(leadId);
+    if (!fresh || fresh.opted_out || fresh.human_handoff) {
+      staleReruns.delete(leadId);
+      console.log(`[engine] lead ${leadId} opted out or handed off mid-turn; discarding reply`);
+      return;
+    }
+
     // Stale-turn check: did new inbound text arrive while the brain call was
     // in flight? If so this reply would answer content the lead has already
     // added to — discard it (never send, never write) and let the next turn
