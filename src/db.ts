@@ -324,12 +324,18 @@ export async function insertInboundMessage(
   return 'error';
 }
 
-export async function getConversation(leadId: string): Promise<StoredMessage[]> {
+// Bounded to the most recent `limit` messages — an unbounded history is what
+// let a single prompt balloon past Groq's tokens-per-minute cap (8000/min,
+// one request asked for 8104) as a conversation lengthened. Fetches newest
+// first (so the cap keeps the RECENT messages, not the oldest) then reverses
+// before returning so callers still see chronological (oldest-first) order —
+// engine.ts's history.slice() logic depends on that ordering.
+export async function getConversation(leadId: string, limit = 20): Promise<StoredMessage[]> {
   const { data, error } = await supabase
     .from('messages').select('direction, body')
-    .eq('lead_id', leadId).order('created_at', { ascending: true });
+    .eq('lead_id', leadId).order('created_at', { ascending: false }).limit(limit);
   if (error) { console.error('[db] getConversation', error.message); return []; }
-  return (data ?? []) as StoredMessage[];
+  return ((data ?? []) as StoredMessage[]).reverse();
 }
 
 export async function countMessages(leadId: string): Promise<number> {

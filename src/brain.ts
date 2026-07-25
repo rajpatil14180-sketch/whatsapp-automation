@@ -1,4 +1,4 @@
-import Groq from 'groq-sdk';
+import Groq, { APIError } from 'groq-sdk';
 import { config } from './config';
 import { Tenant, Lead, StoredMessage, BrainResult, QualifyingConfig } from './types';
 
@@ -11,71 +11,62 @@ const client = new Groq({ apiKey: config.groqKey });
 // new vertical is onboarded with a tenant row — no code change.
 // ============================================================
 
-// The study-abroad default: the THREE-QUESTION judgment model.
-// A lead is judged by (1) decided to go? (2) parents convinced? (3) money
-// handled? — never by a checklist of documents. See README "The default
-// study-abroad brain".
+// The study-abroad default: the INTENT-FIRST judgment model.
+// A lead is scored on how SPECIFIC they are — country, course level, and
+// whether they have a university/city in mind — not on a decided/parents/
+// money checklist. Money and family are passive, reactive-only signals, never
+// interrogated for. See README "The default study-abroad brain".
 export const DEFAULT_STUDY_ABROAD_CONFIG: QualifyingConfig = {
   vertical_description: 'an education consultancy that helps Indian students study abroad',
   fields_to_extract: [
-    'decided_to_go: have they DECIDED to go abroad? (unsure about WHICH country does not count against them)',
-    'target_country: where they want to study — undecided is fine, store null',
-    'parents_convinced: are the parents on board?',
-    'finance_situation: do they have the funds, or do they need financing?',
-    'loan_openness: if they need financing — are they open to an education loan? (only once money uncertainty has come up)',
-    'scholarship_expectation: if they refuse a loan — do they need a 100% scholarship, or is partial + self-funding okay?',
+    'target_country: which country/countries they have named, or "undecided" once you have actually asked and they do not know yet — leave null until it has come up',
+    'course_level: "bachelors" or "masters"',
+    'university_shortlisted: do they have a specific university or even just a city in mind ("yes_specific"), or do they know they want to go but have not looked at specifics yet ("exploring")',
     'intake: which intake (e.g. "Sept 2026", "Feb 2027")',
     'documents_pending: pending items like 12th result / IELTS / offer letter — informational only, NEVER lowers the lead',
     'meeting_time: the proposed/agreed counsellor-call time once one is discussed (e.g. "tomorrow 4pm IST") — this is the booking you work toward with a hot lead',
+    'counsellor_notes: PASSIVE ONLY — a short, factual one-line brief for the counsellor capturing anything the student volunteered that helps the call (e.g. money sensitivity, family involvement). Never something you ask about directly, and never a figure you would state to the student',
   ],
   blocker_taxonomy: [
-    'none', 'parents_not_convinced', 'undecided_to_go', 'scholarship_100_only',
-    'loan_refused_no_self_funding', 'money_unresolved', 'insufficient_information', 'other',
+    'none', 'undecided_country', 'not_committed_to_going',
+    'no_university_shortlisted', 'insufficient_information', 'other',
   ],
-  core_signal_fields: ['decided_to_go', 'parents_convinced', 'finance_situation'],
-  classification_rules: `JUDGMENT MODEL — THE THREE QUESTIONS:
-Every lead is judged by working out the answers to just three questions, through natural conversation — never an interrogation:
-Q1. Have they DECIDED to go abroad? Being unsure about WHICH country does NOT count against them — as long as going abroad itself is decided.
-Q2. Are the PARENTS convinced?
-Q3. Is the MONEY handled? (sub-tree below)
+  core_signal_fields: ['target_country', 'course_level', 'university_shortlisted'],
+  classification_rules: `HOW TO SCORE THIS LEAD — you are qualifying for a study-abroad counsellor whose goal is to enrol serious students. Judge these three things naturally through conversation, never as a checklist or a rapid-fire sequence:
+  1. Which country they want (decided, or narrowing to a few — both fine).
+  2. Bachelor's or master's.
+  3. How far along they are — do they have a university or even a specific city in mind, or are they still exploring?
 
-CORE PRINCIPLE — A BLOCKED DOCUMENT IS NOT A BLOCKED LEAD:
-A student who has decided to go and whose parents are on board is a HOT lead even if they are "waiting for 12th results", "about to take IELTS", or "don't have an offer letter yet". Those pending items are simply the work the consultancy exists to do — they do NOT lower the lead. Most serious students arrive at exactly this stage (around pre-IELTS or just after), because that is when the application process gets complex and they need a counsellor. This stage is the normal entry point of a good lead, NOT a warning sign. Record such items in "documents_pending" so the counsellor can follow up — never let them reduce the classification.
+CLASSIFY:
+- "hot" — they are SPECIFIC: a named country, a course level, AND a university or city in mind. A student this specific is serious and ready for a counsellor. This is who gets booked. recommended_action "book_call".
+- "warm" — real intent but vague: they want to go and know the level, but no university and no city yet, still exploring. Nurture, do not book yet.
+- "cold" — no real decision: "just looking", no country, no level. Keep it light, do not push.
 
-THE MONEY SUB-TREE (Q3):
-- They HAVE the funds → money is handled.
-- They do NOT have the funds / raise money uncertainty → do NOT judge them yet. Gently and REACTIVELY surface financing as an option — e.g. "Scholarships can cover a lot, and if it doesn't fully come through, many students fund the rest through an education loan — would that be something you'd consider?" Do this ONLY when money uncertainty actually comes up; NEVER push financing on a student who hasn't raised a money concern (it feels salesy and hurts the consultancy's brand). Then read their answer:
-  - OPEN to a loan → money is handled-enough → the lead stays/returns HOT (they are committed; the loan is just logistics).
-  - NO loan — scholarship only → dig ONE level further: do they need a 100% scholarship, or are they okay with a PARTIAL scholarship and arranging the rest themselves?
-    - Okay with partial + will cover the remainder themselves → still a reasonably serious, convertible lead — they are putting in their own money.
-    - Only willing to go with a 100% scholarship, no loan, no own contribution → the WEAKEST lead. Their whole plan depends on free money that may never arrive, and they have shown they won't move without it. Lowest priority.
+A pending DOCUMENT (IELTS not taken, offer letter awaited, 12th marks) does NOT lower a hot lead — it is just work ahead; record it in "documents_pending" so the counsellor can follow up, never let it reduce the classification. A blocked DECISION (undecided country, not actually committed to going) DOES lower it.
 
-CLASSIFICATION, DERIVED FROM THE THREE ANSWERS:
-- "hot" — ALL of: decided to go = yes, parents convinced = yes, and money is resolved-enough (has funds, OR needs financing but open to a loan, OR refuses a loan but is okay with a partial scholarship + self-funding the rest). recommended_action "book_call". Any pending documents are noted in documents_pending but do NOT reduce this.
+MONEY — REACTIVE ONLY: NEVER raise money, cost, funding, loans or scholarships yourself, and never steer toward them. Many students believe "studying abroad is only for the rich", and a money question early makes them feel judged and they leave. BUT: if the STUDENT asks about cost, fees, affordability, scholarships or loans, answer them helpfully and directly using WHAT YOU KNOW — do not dodge, do not deflect to a call. A student asking about money is showing genuine interest; a real answer builds trust. If WHAT YOU KNOW does not contain the figure, say honestly you would rather not quote a number you are unsure of and the counsellor can confirm it — never invent one. Money is NEVER a core signal and NEVER blocks or triggers a booking on its own; whatever comes up, note it in "counsellor_notes" as passive context.
+
+PARENTS — INDIRECT ONLY: NEVER ask directly whether their parents are convinced or on board — it feels like probing for a weakness, and most students have already spoken to their family. If it is useful to understand family involvement, surface it sideways and warmly, e.g. "Is this something you're planning together with your family?" or "Have you and your family looked at any options yet?". Whatever emerges — family supportive, or still being brought around — record it as passive context in "counsellor_notes". It NEVER blocks or triggers a booking.
 
 HOT-LEAD GOAL — SECURE THE CALL TIME AND COMPLETE THE SUMMARY:
 Once a lead is hot, your job is to lock in a SPECIFIC time for the counsellor call: offer a couple of concrete options, converge on one, and record it in "meeting_time" (keep updating it if the time changes). YOU stay in the conversation and drive it to a confirmed time — you never go silent on a hot lead; what the counsellor receives is the booking (a summary plus the time), not the live chat. Only set conversation_complete once the time is confirmed.
-The counsellor handover happens ONCE, when there is a real summary — not the instant "hot" is first suspected. So keep the conversation flowing naturally until you have the handover details filled in: target country (or that it's genuinely undecided), intake, their money stance, and a proposed call time. Gather these through normal warm chat, never as a form.
-- "warm" — a genuine fundamental is unresolved but the lead is still workable and worth nurturing: parents are not convinced (the student decided but cannot convince their own parents — genuinely difficult and not something the consultancy can easily fix, so warm, NOT hot), OR not yet decided about going, OR money uncertainty has just been raised and the financing question is still being explored (stay warm until their loan/scholarship stance is clear, then re-classify).
-- "cold" — the weakest, lowest-priority (but still a lead — nobody is discarded): will only go with a 100% scholarship and refuses both a loan and any self-funding, or is clearly not committed to going at all. Light nurture only.
+The counsellor handover happens ONCE, when there is a real summary — not the instant "hot" is first suspected. So keep the conversation flowing naturally until you have the handover details filled in: the country, the course level, the university/city in mind, intake, and a proposed call time. Gather these through normal warm chat, never as a form.
 
-BLOCKER = the single primary reason the lead is NOT hot ("none" if hot). Pick the one that decided the classification.
+BLOCKER = the single primary reason the lead is NOT hot ("none" if hot). A blocker is only valid if the lead has actually indicated it. If the reason they are not hot is simply that you have not learned enough yet, the blocker is "insufficient_information". Never invent a blocker for something not discussed.
 
-FRAMING RULE: everyone who is thinking about studying abroad is a lead. Nobody is thrown away. The only question is hot vs warm vs cold — decided by the three answers above, NOT by any checklist of documents.
+FRAMING RULE: everyone who is thinking about studying abroad is a lead. Nobody is thrown away. The only question is hot vs warm vs cold — decided by the three things above, NOT by any checklist of documents.
 
-CONVERSATION RULES: weave the three questions into natural conversation, ONE thing at a time, the way a warm counsellor would — never fire multiple questions in a row, never sound like a form. Raise the loan/financing option reactively only, as described above.
+CONVERSATION RULES: weave the three things into natural conversation, ONE thing at a time, the way a warm counsellor would — never fire multiple questions in a row, never sound like a form.
 
-REASONING: in one plain sentence, state which of the three questions decided the classification — e.g. "Hot: decided to go, parents on board, open to a loan for the gap" or "Warm: keen and funded but parents not yet convinced."`,
+REASONING: in one plain sentence, state which of the three things decided the classification — e.g. "Hot: named Canada, wants a master's, and has shortlisted a university" or "Warm: keen on the UK for a master's but hasn't looked at universities yet."`,
   extracted_schema: `{
-    "decided_to_go": "yes" | "no" | "unclear",
     "target_country": string | null,
-    "parents_convinced": "yes" | "no" | "unclear",
-    "finance_situation": "has_funds" | "needs_financing" | "unclear",
-    "loan_openness": "open" | "refused" | "not_discussed",
-    "scholarship_expectation": "full_required" | "partial_ok" | "not_discussed",
+    "course_level": "bachelors" | "masters" | "unclear",
+    "university_shortlisted": "yes_specific" | "exploring" | "unclear",
     "intake": string | null,
     "documents_pending": string[],
-    "meeting_time": string | null
+    "meeting_time": string | null,
+    "counsellor_notes": string
   }`,
   allowed_facts: [],
   forbidden_topics: [],
@@ -116,14 +107,14 @@ const BOOKING_DISCIPLINE = `BOOKING DISCIPLINE — WHEN YOU MAY PROPOSE A CALL:
 - Booking re-opens when EITHER: (a) the lead gives a clear positive signal — agreeing to something, asking what happens next, asking about the counsellor, or confirming a core signal positively; or (b) you have genuinely answered what they were asking, the conversation has moved on, and they have paused. When it re-opens, raise it ONCE, lightly, and only after they have what they asked for.
 - If the lead refuses a second time, do not propose a call again for the rest of the conversation unless they raise it themselves.
 - Never answer a request for information with a call proposal. Answer in chat first, fully. The call is never a substitute for an answer.
-- When the condition above is not yet met, end your reply with ONE question aimed at the single most valuable thing you still do not know, in this priority order: whether they have decided to go abroad, whether their parents are on board, then their money situation. Financing itself is only ever raised reactively, after the lead has raised a money concern (per the money sub-tree above).`;
+- When the condition above is not yet met, end your reply with ONE question aimed at the single most valuable thing you still do not know, in this priority order: which country, then bachelor's or master's, then whether they have a university or city in mind. Money and family are never core signals — see MONEY — REACTIVE ONLY and PARENTS — INDIRECT ONLY above; do not raise either as a way of learning more.`;
 
 // KEEPING THE CONVERSATION ALIVE AND MOVING — fixed and vertical-independent,
 // same tier as OPENING POSTURE / BOOKING DISCIPLINE / ESCALATION. Fixes the
 // opposite failure from BOOKING_DISCIPLINE: answering politely forever without
 // ever learning the core signals needed to score the lead.
 const KEEPING_IT_MOVING = `KEEPING THE CONVERSATION ALIVE AND MOVING:
-- You will be told which core signals are still unknown (see STILL UNKNOWN in the user message). Learning them is your job. Never ask for them as a list or in sequence — work ONE into the flow of the conversation naturally, in this priority order: whether they have decided to go abroad, whether their parents are on board, then their money situation (financing is only ever raised reactively, per the existing rule).
+- You will be told which core signals are still unknown (see STILL UNKNOWN in the user message). Learning them is your job. Never ask for them as a list or in sequence — work ONE into the flow of the conversation naturally, in this priority order: which country, then bachelor's or master's, then whether they have a university or city in mind. Money and family are never core signals and are never raised by you — see MONEY — REACTIVE ONLY and PARENTS — INDIRECT ONLY.
 - Do NOT let the conversation become a help desk. If the lead has sent several purely informational messages and a core signal is still unknown, you must work one in — answer what they asked properly first, then ask.
 - Questions that are not core signals — what field they want to study, which university, general interest questions — are fine to ask ONLY when every core signal is already known, or as a natural bridge into one. They are never a substitute for a core signal question.
 - If the lead's replies become short, low-effort, or sound like they are wrapping up ("ok", "thanks", "got it", "will see"), treat that as your LAST chance in this conversation. Acknowledge them warmly and ask the single highest-priority unknown signal in one short, easy-to-answer sentence. Do not let a conversation end with core signals unknown just because the lead went quiet.
@@ -248,8 +239,31 @@ function transcriptText(history: StoredMessage[]): string {
 // Reasoning models (e.g. openai/gpt-oss-120b) spend part of the completion
 // budget on hidden reasoning tokens before ever writing the JSON reply, so the
 // limit has to cover reasoning + the reply comfortably, not just the reply.
-const BASE_MAX_COMPLETION_TOKENS = 2048;
+// Kept modest — replies are short, and a large reserve here is what let a
+// single request balloon past Groq's TPM cap (8000 tok/min, one request
+// asked for 8104) when combined with an unbounded conversation history.
+const BASE_MAX_COMPLETION_TOKENS = 1024;
 const RETRY_MAX_COMPLETION_TOKENS = 4096;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const DEFAULT_RATE_LIMIT_RETRY_MS = 2000;
+
+// Groq's rate-limit responses are HTTP 413 (payload too large for the TPM
+// window) or 429 (request-rate), sometimes with an "error.code" of
+// "rate_limit_exceeded" instead of/alongside the status. Distinguishing this
+// from a truncation matters: asking for MORE tokens on a rate limit only
+// guarantees another failure.
+function classifyRateLimit(e: unknown): { isRateLimit: boolean; retryAfterMs: number } {
+  if (!(e instanceof APIError)) return { isRateLimit: false, retryAfterMs: 0 };
+  const body = e.error as { error?: { code?: string; type?: string } } | undefined;
+  const code = body?.error?.code ?? body?.error?.type;
+  const isRateLimit = e.status === 413 || e.status === 429 || code === 'rate_limit_exceeded';
+  if (!isRateLimit) return { isRateLimit: false, retryAfterMs: 0 };
+  const header = e.headers?.get?.('retry-after');
+  const seconds = header ? parseFloat(header) : NaN;
+  const retryAfterMs = Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : DEFAULT_RATE_LIMIT_RETRY_MS;
+  return { isRateLimit: true, retryAfterMs };
+}
 
 const ALLOWED_REASONING_EFFORTS = ['none', 'default', 'low', 'medium', 'high'] as const;
 type ReasoningEffort = (typeof ALLOWED_REASONING_EFFORTS)[number];
@@ -314,50 +328,88 @@ Analyse and respond with the JSON object only.`;
   const system = systemPrompt(tenant, lead.initiated_by ?? 'us');
   const reasoningEffort = resolveReasoningEffort();
 
-  // One attempt at a given token budget. Kept as a closure so the automatic
-  // retry (below) can re-run the identical request with a higher limit
-  // without duplicating the call/logging logic.
-  const attempt = async (maxCompletionTokens: number): Promise<BrainResult | null> => {
-    const res = await client.chat.completions.create({
-      model: config.groqModel,
-      max_completion_tokens: maxCompletionTokens, // max_tokens is deprecated on Groq's API in favor of this
-      reasoning_effort: reasoningEffort, // kept small by default — this is a latency-sensitive instant-response product
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    });
-    const choice = res.choices[0];
-    const finishReason = choice?.finish_reason;
-    if (finishReason === 'length') {
-      // Distinct from a parse failure: the model was cut off mid-answer, not
-      // confused. Must be immediately identifiable in logs, not just "bad JSON".
-      console.warn(
-        `[brain] TRUNCATED completion (finish_reason=length, max_completion_tokens=${maxCompletionTokens}) — reasoning + reply did not fit in the token budget`
-      );
-    } else {
-      console.log(`[brain] completion finished (finish_reason=${finishReason ?? 'unknown'})`);
+  // Rough visibility into prompt growth (~4 chars/token) — logged before it
+  // becomes a failure, since unbounded conversation history is what caused
+  // the TPM 413 this budget/retry logic now guards against.
+  const approxInputTokens = Math.ceil((system.length + user.length) / 4);
+
+  // One attempt at a given token budget. Kept as a closure so retries can
+  // re-run the identical request without duplicating the call/logging logic.
+  // Catches its own errors so the caller can tell a truncation (retry BIGGER),
+  // a rate limit (retry the SAME size, after waiting), and any other failure
+  // (don't retry) apart — never confusing one for another.
+  type AttemptOutcome =
+    | { kind: 'ok'; result: BrainResult }
+    | { kind: 'truncated_or_unparseable' }
+    | { kind: 'rate_limited'; retryAfterMs: number }
+    | { kind: 'error' };
+
+  const attempt = async (maxCompletionTokens: number): Promise<AttemptOutcome> => {
+    const startedAt = Date.now();
+    try {
+      const res = await client.chat.completions.create({
+        model: config.groqModel,
+        max_completion_tokens: maxCompletionTokens, // max_tokens is deprecated on Groq's API in favor of this
+        reasoning_effort: reasoningEffort, // kept small by default — this is a latency-sensitive instant-response product
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user },
+        ],
+      });
+      const durationMs = Date.now() - startedAt;
+      const choice = res.choices[0];
+      const finishReason = choice?.finish_reason;
+      if (finishReason === 'length') {
+        // Distinct from a parse failure: the model was cut off mid-answer, not
+        // confused. Must be immediately identifiable in logs, not just "bad JSON".
+        console.warn(
+          `[brain] TRUNCATED completion (finish_reason=length, max_completion_tokens=${maxCompletionTokens}, ~${approxInputTokens} input tokens, ${durationMs}ms) — reasoning + reply did not fit in the token budget`
+        );
+        return { kind: 'truncated_or_unparseable' };
+      }
+      console.log(`[brain] completion finished (finish_reason=${finishReason ?? 'unknown'}, ~${approxInputTokens} input tokens, ${durationMs}ms)`);
+      const parsed = parseBrain(choice?.message?.content ?? '');
+      return parsed ? { kind: 'ok', result: parsed } : { kind: 'truncated_or_unparseable' };
+    } catch (e) {
+      const durationMs = Date.now() - startedAt;
+      const { isRateLimit, retryAfterMs } = classifyRateLimit(e);
+      if (isRateLimit) {
+        // Distinct log line so this is never mistaken for a truncation again —
+        // the fix for one (more tokens) is exactly wrong for the other.
+        console.warn(`[brain] RATE LIMITED (~${approxInputTokens} input tokens, ${durationMs}ms) — retrying same size after ${retryAfterMs}ms`);
+        return { kind: 'rate_limited', retryAfterMs };
+      }
+      console.error(`[brain] error (~${approxInputTokens} input tokens, ${durationMs}ms)`, e);
+      return { kind: 'error' };
     }
-    return parseBrain(choice?.message?.content ?? '');
   };
 
-  try {
-    const result = await attempt(BASE_MAX_COMPLETION_TOKENS);
-    if (result) return result;
+  const first = await attempt(BASE_MAX_COMPLETION_TOKENS);
+  if (first.kind === 'ok') return first.result;
 
+  if (first.kind === 'rate_limited') {
+    // Same token size — asking for MORE on a rate limit only guarantees
+    // another failure. One retry, after the provider's own backoff window.
+    await sleep(first.retryAfterMs);
+    const retry = await attempt(BASE_MAX_COMPLETION_TOKENS);
+    if (retry.kind === 'ok') return retry.result;
+    console.error('[brain] still rate-limited (or failing) after backoff retry; giving up for this turn');
+    return null;
+  }
+
+  if (first.kind === 'truncated_or_unparseable') {
     // A first-attempt parse failure is most often truncation, not a genuinely
     // malformed reply — one retry at a higher budget before giving up.
     console.warn('[brain] parse failed on first attempt; retrying once with a higher token limit');
-    const retryResult = await attempt(RETRY_MAX_COMPLETION_TOKENS);
-    if (retryResult) return retryResult;
-
+    const retry = await attempt(RETRY_MAX_COMPLETION_TOKENS);
+    if (retry.kind === 'ok') return retry.result;
     console.error('[brain] parse failed again after retry; giving up for this turn');
     return null;
-  } catch (e) {
-    console.error('[brain] error', e);
-    return null;
   }
+
+  // Some other API error (auth, connection, 5xx...) — not retried here.
+  return null;
 }
 
 function parseBrain(raw: string): BrainResult | null {

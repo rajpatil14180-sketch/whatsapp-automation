@@ -107,7 +107,7 @@ export interface StoredMessage {
 // study-abroad default that reproduces the original behavior exactly.
 export interface QualifyingConfig {
   vertical_description: string;   // "an education consultancy that helps Indian students study abroad"
-  fields_to_extract: string[];    // e.g. "decided_to_go: have they decided to go abroad?"
+  fields_to_extract: string[];    // e.g. "target_country: which country/countries they've named"
   blocker_taxonomy: string[];     // primary reason a lead is NOT hot; "none" when hot
   classification_rules: string;   // domain judgment rules for hot/warm/cold
   allowed_facts: string[];        // facts the assistant MAY state
@@ -120,25 +120,27 @@ export interface QualifyingConfig {
 }
 
 // What the brain returns for every inbound message. This is the product's core.
-// The extracted shape below is the study-abroad three-question model
-// (decided? / parents? / money?); other verticals use the index signature.
+// The extracted shape below is the study-abroad INTENT-FIRST model — a lead is
+// scored on how SPECIFIC they are (country / course level / university or
+// city in mind), not on decision-and-money-and-parents. Money and family are
+// passive, reactive-only signals captured in free-text `counsellor_notes`,
+// never structured fields the bot interrogates for. Other verticals use the
+// index signature.
 export interface BrainResult {
   classification: 'hot' | 'warm' | 'cold';
   intent_level: 'high' | 'medium' | 'low';
   // The single primary reason the lead is NOT hot; "none" when hot.
-  // Study-abroad taxonomy: none | parents_not_convinced | undecided_to_go |
-  // scholarship_100_only | loan_refused_no_self_funding | money_unresolved | other
+  // Study-abroad taxonomy: none | undecided_country | not_committed_to_going |
+  // no_university_shortlisted | insufficient_information | other
   blocker: string;
   extracted: {
-    decided_to_go?: 'yes' | 'no' | 'unclear';
-    target_country?: string | null;          // undecided is fine — null if not chosen
-    parents_convinced?: 'yes' | 'no' | 'unclear';
-    finance_situation?: 'has_funds' | 'needs_financing' | 'unclear';
-    loan_openness?: 'open' | 'refused' | 'not_discussed';               // when needs_financing
-    scholarship_expectation?: 'full_required' | 'partial_ok' | 'not_discussed'; // when loan refused
+    target_country?: string | null;          // country/countries named, or "undecided" once asked; null until it's come up
+    course_level?: 'bachelors' | 'masters' | 'unclear';
+    university_shortlisted?: 'yes_specific' | 'exploring' | 'unclear'; // named a university/city | knows they want to go, no specifics yet | not yet known
     intake?: string | null;
     documents_pending?: string[];            // informational ONLY; never lowers a hot lead
     meeting_time?: string | null;            // proposed/agreed counsellor-call time (the "booking")
+    counsellor_notes?: string;               // passive signals only (money sensitivity, family involvement...) — NEVER a figure the bot would state to the student
     [k: string]: unknown;
   };
   recommended_action: 'book_call' | 'nurture' | 'chase_document' | 'close';

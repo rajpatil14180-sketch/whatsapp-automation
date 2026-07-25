@@ -677,13 +677,15 @@ async function notifyCounsellor(tenant: Tenant, lead: Lead, r: BrainResult): Pro
   const e = { ...(lead.extracted ?? {}), ...r.extracted } as BrainResult['extracted'];
 
   // Fix 5: don't hand over a bare "hot" with no substance — wait until the AI
-  // has a real summary (core signals + at least one concrete detail). A later
-  // turn will alert once the detail exists; the brain is instructed to keep
-  // gathering it.
+  // has a real summary. Under the intent-first model the core triple itself
+  // (country + course level + university/city) IS the real summary — hot
+  // already requires all three (see classification_rules), so there is no
+  // longer a separate "at least one extra detail" check to bolt on. A later
+  // turn will alert once the triple is filled in; the brain is instructed to
+  // keep gathering it.
   const known = (v: unknown) => v !== undefined && v !== null && v !== '' && v !== 'unclear';
-  const coreKnown = known(e.decided_to_go) && known(e.parents_convinced);
-  const detailKnown = known(e.target_country) || known(e.intake) || known(e.finance_situation);
-  if (!coreKnown || !detailKnown) {
+  const coreKnown = known(e.target_country) && known(e.course_level) && known(e.university_shortlisted);
+  if (!coreKnown) {
     console.log(`[engine] ${lead.phone} is hot but the summary is still thin — deferring the counsellor alert`);
     return;
   }
@@ -691,25 +693,19 @@ async function notifyCounsellor(tenant: Tenant, lead: Lead, r: BrainResult): Pro
   // Claim the one-shot BEFORE sending so no later turn can double-alert.
   await db.markHotAlerted(lead.id);
 
-  // Money line follows the Q3 sub-tree: loan stance only matters when financing
-  // is needed; scholarship expectation only when a loan was refused.
-  let money = e.finance_situation ?? '?';
-  if (e.finance_situation === 'needs_financing' && e.loan_openness && e.loan_openness !== 'not_discussed') {
-    money += ` (loan: ${e.loan_openness}`;
-    if (e.loan_openness === 'refused' && e.scholarship_expectation && e.scholarship_expectation !== 'not_discussed') {
-      money += `, scholarship: ${e.scholarship_expectation}`;
-    }
-    money += ')';
-  }
   const docs = e.documents_pending?.length ? e.documents_pending.join(', ') : 'none noted';
+  // Passive context only (cost-sensitivity, family situation...) — omitted
+  // entirely when empty rather than shown as blank.
+  const notesLine = e.counsellor_notes?.trim() ? `Notes: ${e.counsellor_notes.trim()}\n` : '';
   // This is a BOOKING notification, not a conversation handoff — the AI keeps
   // the chat and keeps working toward/confirming the call time.
   const summary =
     `🔥 HOT LEAD — ${lead.name ?? lead.phone}\n` +
     `Proposed call: ${e.meeting_time ?? 'to be confirmed'}\n` +
-    `Country: ${e.target_country ?? 'undecided'} | Intake: ${e.intake ?? '?'}\n` +
-    `Decided to go: ${e.decided_to_go ?? '?'} | Parents: ${e.parents_convinced ?? '?'} | Money: ${money}\n` +
+    `Country: ${e.target_country ?? 'undecided'} | Level: ${e.course_level ?? '?'} | Intake: ${e.intake ?? '?'}\n` +
+    `Stage: ${e.university_shortlisted ?? '?'}\n` +
     `Docs to chase (not blockers): ${docs}\n` +
+    notesLine +
     `Blocker: ${r.blocker}\n` +
     `Why: ${r.reasoning}\n` +
     `Student WhatsApp: +${lead.phone}\n` +
