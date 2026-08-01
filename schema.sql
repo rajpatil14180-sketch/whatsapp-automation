@@ -194,11 +194,12 @@ alter table leads add column if not exists hot_alerted boolean not null default 
 -- Append-only: safe to run on an existing database.
 -- ============================================================
 
--- Curated factual content (published fees/tuition ranges, intakes, scholarship
--- programs, etc.) that the AI may state directly in chat. Nullable — leads are
--- handled exactly as before if left unset (the brain simply has no specifics
--- to draw on and defers numbers to the counsellor). Anything in here is also
--- treated as guard-allowed by sanitizeReply's amount check (see brain.ts).
+-- Curated, HUMAN-VERIFIED factual content (published fees/tuition ranges,
+-- intakes, scholarship programs, etc.) that the AI may state directly in
+-- chat. Nullable — empty is the safe default: leads are handled exactly as
+-- before, the brain simply has no specifics to draw on and defers all
+-- numbers to the counsellor. Anything in here is also treated as the guard's
+-- amount-allowlist by sanitizeReply's amount check (see brain.ts).
 alter table tenants add column if not exists knowledge_base text;
 
 -- ============================================================

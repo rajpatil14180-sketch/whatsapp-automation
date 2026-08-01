@@ -37,9 +37,10 @@ export interface Tenant {
   // else wa_opening_template. Every referenced template must be Meta-approved.
   opener_rules: OpenerRule[];
 
-  // Migration 005 — curated factual content the AI may state directly in
-  // chat (published fees/tuition ranges, intakes, scholarship programs...).
-  // Nullable; empty/missing means the brain has no specifics to draw on.
+  // Migration 005 — curated, HUMAN-VERIFIED factual content the AI may state
+  // directly in chat (published fees/tuition ranges, intakes, scholarship
+  // programs...). Nullable; empty/missing means the brain has no specifics
+  // to draw on and defers all numbers to the counsellor.
   knowledge_base?: string | null;
 
   // Migration 006 — quiet hours for PROACTIVE messages only (stall nudge,
