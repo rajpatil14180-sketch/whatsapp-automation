@@ -163,9 +163,15 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
 // and a one-word fragment the same. WhatsApp delivers no typing-indicator
 // webhook, so this can only be driven by message CONTENT and ARRIVAL, never
 // typing state. debounceForText() picks the quiet period per message:
-//   SHORT  — reads as a complete question/thought: reply almost immediately.
-//   LONG   — reads as a fragment (still typing): give them room to continue.
-//   NORMAL — everything else.
+//   SHORT  — reads as COMPLETE: a question, anything ending in terminal
+//            punctuation, or a common short complete reply (greeting,
+//            yes/no, ok, thanks...) — reply almost immediately. A one-word
+//            "hello" opener is the biggest chunk of dead air otherwise.
+//   LONG   — reads as a genuine trailing FRAGMENT (still typing): give them
+//            room to continue. Only <=3 words, no terminal punctuation, AND
+//            not a known complete short reply — "hi"/"ok" must never land
+//            here.
+//   NORMAL — everything else (longer, unpunctuated, mid-thought statements).
 // Every new message re-clears and restarts the timer using ITS OWN
 // classification, so the wait is always recomputed from the LATEST message —
 // deliberately NO time ceiling: if the lead keeps typing, keep waiting, since
@@ -174,12 +180,25 @@ export async function handleNewLead(tenant: Tenant, normalized: NormalizedLead):
 // spammer or broken client, not against normal typing.
 export const DEBOUNCE_SHORT_MS = 2500;
 export const DEBOUNCE_LONG_MS = 14000;
-export const DEBOUNCE_NORMAL_MS = 7000;
+export const DEBOUNCE_NORMAL_MS = 4000;
 const MAX_PENDING_MESSAGES = 12;
 
 const INTERROGATIVE_WORDS = new Set([
   'what', 'how', 'which', 'when', 'where', 'why', 'who',
   'can', 'could', 'do', 'does', 'is', 'are', 'should', 'will',
+]);
+
+// Common complete short replies — greetings and acknowledgements that are
+// short (<=3 words) but are NOT "still typing" fragments; matched on the
+// whole message (lowercased, punctuation stripped) so "hi", "ok", "thank
+// you" etc. all hit this even without trailing punctuation.
+const COMPLETE_SHORT_REPLIES = new Set([
+  'hi', 'hello', 'hey', 'hiya', 'yo',
+  'yes', 'yeah', 'yep', 'yup',
+  'no', 'nope', 'nah',
+  'ok', 'okay', 'k',
+  'sure', 'sure thing', 'alright', 'all right',
+  'thanks', 'thank you', 'thx', 'ty',
 ]);
 
 // Returns the quiet period to use for a just-arrived message.
@@ -188,14 +207,23 @@ export function debounceForText(text: string): number {
   const words = trimmed.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
   const firstWord = (words[0] ?? '').toLowerCase().replace(/[^a-z']/g, '');
+  const normalized = trimmed.toLowerCase().replace(/[^a-z\s']/g, '').trim();
 
   const endsInQuestionMark = trimmed.endsWith('?');
   const interrogativeOpener = INTERROGATIVE_WORDS.has(firstWord) && wordCount >= 4;
   const isLong = wordCount >= 25;
-  if (endsInQuestionMark || interrogativeOpener || isLong) return DEBOUNCE_SHORT_MS;
-
   const endsWithTerminalPunctuation = /[.!?]$/.test(trimmed);
-  if (wordCount <= 3 && !endsWithTerminalPunctuation) return DEBOUNCE_LONG_MS;
+  const isCompleteShortReply = COMPLETE_SHORT_REPLIES.has(normalized);
+
+  if (endsInQuestionMark || interrogativeOpener || isLong || endsWithTerminalPunctuation || isCompleteShortReply) {
+    return DEBOUNCE_SHORT_MS;
+  }
+
+  // Only a genuine trailing fragment — short, unpunctuated, and not a known
+  // complete reply — gets the long "still typing" allowance.
+  if (wordCount <= 3 && !endsWithTerminalPunctuation && !isCompleteShortReply) {
+    return DEBOUNCE_LONG_MS;
+  }
 
   return DEBOUNCE_NORMAL_MS;
 }
