@@ -125,16 +125,21 @@ export interface QualifyingConfig {
 // scored on how SPECIFIC they are (country / course level / university or
 // city in mind), not on decision-and-money-and-parents. Money and family are
 // passive, reactive-only signals captured in free-text `counsellor_notes`,
-// never structured fields the bot interrogates for. Other verticals use the
-// index signature.
+// never structured fields the bot interrogates for. service_intent is
+// established BEFORE the degree-qualification spine, since not every lead
+// wants a full admission — HOT is judged against whichever service they
+// actually want (see classification_rules). Other verticals use the index
+// signature.
 export interface BrainResult {
   classification: 'hot' | 'warm' | 'cold';
   intent_level: 'high' | 'medium' | 'low';
   // The single primary reason the lead is NOT hot; "none" when hot.
   // Study-abroad taxonomy: none | undecided_country | not_committed_to_going |
-  // no_university_shortlisted | insufficient_information | other
+  // no_university_shortlisted | narrow_service_not_specific |
+  // insufficient_information | other
   blocker: string;
   extracted: {
+    service_intent?: 'degree_admission' | 'visa_only' | 'application_help' | 'test_prep' | 'exploring' | 'unclear'; // what they actually want from the consultancy — established BEFORE country/level/university
     target_country?: string | null;          // country/countries named, or "undecided" once asked; null until it's come up
     course_level?: 'bachelors' | 'masters' | 'unclear';
     university_shortlisted?: 'yes_specific' | 'exploring' | 'unclear'; // named a university/city | knows they want to go, no specifics yet | not yet known

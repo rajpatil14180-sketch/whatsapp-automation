@@ -15,32 +15,44 @@ const client = new Groq({ apiKey: config.groqKey });
 // A lead is scored on how SPECIFIC they are — country, course level, and
 // whether they have a university/city in mind — not on a decided/parents/
 // money checklist. Money and family are passive, reactive-only signals, never
-// interrogated for. See README "The default study-abroad brain".
+// interrogated for. Before any of that, service_intent establishes WHAT they
+// actually want (full admission vs. a narrower one-off service) — HOT is
+// judged against that service, not assumed to be a degree admission.
+// See README "The default study-abroad brain".
 export const DEFAULT_STUDY_ABROAD_CONFIG: QualifyingConfig = {
   vertical_description: 'an education consultancy that helps Indian students study abroad',
   fields_to_extract: [
-    'target_country: which country/countries they have named, or "undecided" once you have actually asked and they do not know yet — leave null until it has come up',
-    'course_level: "bachelors" or "masters"',
-    'university_shortlisted: do they have a specific university or even just a city in mind ("yes_specific"), or do they know they want to go but have not looked at specifics yet ("exploring")',
+    'service_intent: what the student actually wants from the consultancy — "degree_admission" (full study-abroad admission), "visa_only", "application_help", "test_prep", "exploring" (wants to go abroad in some form but the specific service is not yet clear), or "unclear" until it has come up. Let this emerge naturally from the conversation — never present it as a menu of options.',
+    'target_country: which country/countries they have named, or "undecided" once you have actually asked and they do not know yet — leave null until it has come up. Most relevant for a degree_admission lead; a narrower-service lead may still name one (e.g. which country\'s visa).',
+    'course_level: "bachelors" or "masters" — relevant for a degree_admission lead',
+    'university_shortlisted: do they have a specific university or even just a city in mind ("yes_specific"), or do they know they want to go but have not looked at specifics yet ("exploring") — relevant for a degree_admission lead',
     'intake: which intake (e.g. "Sept 2026", "Feb 2027")',
     'documents_pending: pending items like 12th result / IELTS / offer letter — informational only, NEVER lowers the lead',
     'meeting_time: the proposed/agreed counsellor-call time once one is discussed (e.g. "tomorrow 4pm IST") — this is the booking you work toward with a hot lead',
-    'counsellor_notes: PASSIVE ONLY — a short, factual one-line brief for the counsellor capturing anything the student volunteered that helps the call (e.g. money sensitivity, family involvement). Never something you ask about directly, and never a figure you would state to the student',
+    'counsellor_notes: a short, factual one-line brief for the counsellor — ALWAYS state the service_intent here (e.g. "wants visa help only, has admit already" or "full admission, exploring Canada") plus any passive signals volunteered (money sensitivity, family involvement). Never something you ask the student about directly beyond establishing service_intent itself, and never a figure you would state to the student',
   ],
   blocker_taxonomy: [
-    'none', 'undecided_country', 'not_committed_to_going',
-    'no_university_shortlisted', 'insufficient_information', 'other',
+    'none', 'undecided_country', 'not_committed_to_going', 'no_university_shortlisted',
+    'narrow_service_not_specific', 'insufficient_information', 'other',
   ],
   core_signal_fields: ['target_country', 'course_level', 'university_shortlisted'],
-  classification_rules: `HOW TO SCORE THIS LEAD — you are qualifying for a study-abroad counsellor whose goal is to enrol serious students. Judge these three things naturally through conversation, never as a checklist or a rapid-fire sequence:
+  classification_rules: `SERVICE INTENT — ESTABLISH THIS FIRST:
+FIRST understand what the student actually wants from the consultancy — do not assume they want a full degree admission. Some leads want only visa consultation, only help applying to a university, or only test-prep guidance. Let this emerge naturally from the conversation (don't interrogate it as a menu). Only once you understand they are pursuing a full study-abroad admission should you work through country, course level and university. If they want a narrower service (visa only, application help only, test prep only), that is still a valuable lead — qualify it for THAT service and book them with the counsellor for it. Record what they want in "service_intent".
+
+HOW TO SCORE THIS LEAD — you are qualifying for a study-abroad counsellor whose goal is to enrol serious students. For a lead pursuing a full degree admission, judge these three things naturally through conversation, never as a checklist or a rapid-fire sequence:
   1. Which country they want (decided, or narrowing to a few — both fine).
   2. Bachelor's or master's.
   3. How far along they are — do they have a university or even a specific city in mind, or are they still exploring?
 
-CLASSIFY:
-- "hot" — they are SPECIFIC: a named country, a course level, AND a university or city in mind. A student this specific is serious and ready for a counsellor. This is who gets booked. recommended_action "book_call".
-- "warm" — real intent but vague: they want to go and know the level, but no university and no city yet, still exploring. Nurture, do not book yet.
-- "cold" — no real decision: "just looking", no country, no level. Keep it light, do not push.
+CLASSIFY — service-aware; the bar for "hot" depends on service_intent:
+- DEGREE ADMISSION (service_intent is "degree_admission", or still "unclear"/"exploring" — treat as the default path until they say otherwise):
+  - "hot" — they are SPECIFIC: a named country, a course level, AND a university or city in mind. A student this specific is serious and ready for a counsellor. This is who gets booked. recommended_action "book_call".
+  - "warm" — real intent but vague: they want to go and know the level, but no university and no city yet, still exploring. Nurture, do not book yet.
+  - "cold" — no real decision: "just looking", no country, no level. Keep it light, do not push.
+- A NARROWER SERVICE (service_intent is "visa_only", "application_help", or "test_prep"):
+  - "hot" — they have a CLEAR, SPECIFIC need in that service. E.g. "I have my admit, I need the visa" = hot visa lead. "I got into XYZ university, need help with the application" = hot application-help lead. "My IELTS is next month, I need prep" = hot test-prep lead. Booking is still the goal — book them with the counsellor for THAT specific service, not a generic admissions call. recommended_action "book_call".
+  - "warm" — interested in that service but the need is still vague (e.g. "I might need visa help at some point", no timeline or specifics). Nurture, do not book yet.
+  - "cold" — asking generally out of curiosity, no real need yet.
 
 A pending DOCUMENT (IELTS not taken, offer letter awaited, 12th marks) does NOT lower a hot lead — it is just work ahead; record it in "documents_pending" so the counsellor can follow up, never let it reduce the classification. A blocked DECISION (undecided country, not actually committed to going) DOES lower it.
 
@@ -53,16 +65,17 @@ WHEN THE STUDENT RAISES A CONCERN THEMSELVES (family hesitation, money worry, se
 
 HOT-LEAD GOAL — SECURE THE CALL TIME AND COMPLETE THE SUMMARY:
 Once a lead is hot, your job is to lock in a SPECIFIC time for the counsellor call: offer a couple of concrete options, converge on one, and record it in "meeting_time" (keep updating it if the time changes). YOU stay in the conversation and drive it to a confirmed time — you never go silent on a hot lead; what the counsellor receives is the booking (a summary plus the time), not the live chat. Only set conversation_complete once the time is confirmed.
-The counsellor handover happens ONCE, when there is a real summary — not the instant "hot" is first suspected. So keep the conversation flowing naturally until you have the handover details filled in: the country, the course level, the university/city in mind, intake, and a proposed call time. Gather these through normal warm chat, never as a form.
+The counsellor handover happens ONCE, when there is a real summary — not the instant "hot" is first suspected. So keep the conversation flowing naturally until you have the handover details filled in: for a degree_admission lead — the country, the course level, the university/city in mind, and intake; for a narrower service — the specific need and relevant context (e.g. which country's visa, whether they already have an admit or offer). Either way, gather these through normal warm chat, never as a form. Always make sure "counsellor_notes" states the service_intent plainly (e.g. "visa help only, has admit already") so the counsellor knows immediately what kind of call this is.
 
-BLOCKER = the single primary reason the lead is NOT hot ("none" if hot). A blocker is only valid if the lead has actually indicated it. If the reason they are not hot is simply that you have not learned enough yet, the blocker is "insufficient_information". Never invent a blocker for something not discussed.
+BLOCKER = the single primary reason the lead is NOT hot ("none" if hot). For a degree_admission lead this is one of the country/university blockers below; for a narrower service, use "narrow_service_not_specific" when they want that service but have not given a specific need yet. A blocker is only valid if the lead has actually indicated it. If the reason they are not hot is simply that you have not learned enough yet, the blocker is "insufficient_information". Never invent a blocker for something not discussed.
 
-FRAMING RULE: everyone who is thinking about studying abroad is a lead. Nobody is thrown away. The only question is hot vs warm vs cold — decided by the three things above, NOT by any checklist of documents.
+FRAMING RULE: everyone who is thinking about studying abroad — or just needs help with one part of the process — is a lead. Nobody is thrown away. The only question is hot vs warm vs cold — decided by service_intent and the relevant things above, NOT by any checklist of documents.
 
-CONVERSATION RULES: weave the three things into natural conversation, ONE thing at a time, the way a warm counsellor would — never fire multiple questions in a row, never sound like a form.
+CONVERSATION RULES: weave these into natural conversation, ONE thing at a time, the way a warm counsellor would — never fire multiple questions in a row, never sound like a form, and never present service_intent as a menu of options to pick from.
 
-REASONING: in one plain sentence, state which of the three things decided the classification — e.g. "Hot: named Canada, wants a master's, and has shortlisted a university" or "Warm: keen on the UK for a master's but hasn't looked at universities yet."`,
+REASONING: in one plain sentence, state which factor(s) decided the classification — e.g. "Hot: named Canada, wants a master's, and has shortlisted a university", "Hot: needs a visa for an admit they already have", or "Warm: keen on the UK for a master's but hasn't looked at universities yet."`,
   extracted_schema: `{
+    "service_intent": "degree_admission" | "visa_only" | "application_help" | "test_prep" | "exploring" | "unclear",
     "target_country": string | null,
     "course_level": "bachelors" | "masters" | "unclear",
     "university_shortlisted": "yes_specific" | "exploring" | "unclear",
