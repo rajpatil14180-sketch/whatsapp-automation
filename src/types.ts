@@ -86,6 +86,11 @@ export interface Lead {
   hot_alerted: boolean;             // the once-ever counsellor booking alert has been sent
   closed_reason: string | null;     // booked | opted_out | exhausted | not_interested | error | other
   processing_until: string | null;  // lightweight sweeper claim
+
+  // Migration 007 — handoff auto-return.
+  handoff_at: string | null;        // when human_handoff was last turned ON; NULL when not in handoff
+  handoff_hold: boolean;            // operator actively handling this lead; AI stays out until cleared manually
+  ai_resumed_count: number;         // times the AI auto-resumed this lead; caps auto-return to once
 }
 
 // The single shape every lead source is converted into before it enters the engine.

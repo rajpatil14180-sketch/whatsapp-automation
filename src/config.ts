@@ -31,6 +31,10 @@ export const config = {
   // Circuit breakers (P2-10). Generous defaults; tune per real volume.
   tenantDailyTemplateCap: parseInt(process.env.TENANT_DAILY_TEMPLATE_CAP || '250', 10),
   claudeCallsPerMinute: parseInt(process.env.CLAUDE_CALLS_PER_MINUTE || '30', 10),
+
+  // Handoff auto-return (migration 007): a lead stuck in human_handoff
+  // returns to the AI after this many hours, unless handoff_hold is set.
+  handoffAutoReturnHours: Number(process.env.HANDOFF_AUTO_RETURN_HOURS ?? 24),
 };
 
 export function assertConfig(): void {

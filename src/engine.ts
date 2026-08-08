@@ -454,7 +454,7 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
             lead.id, 'warn');
         }
       } else {
-        await db.setHumanHandoff(lead.id, true);
+        await db.setHumanHandoff(lead.id);
         clearStallTimer(lead.id);
         await alertOperator(tenant, 'runaway_stop',
           `lead ${lead.name ?? lead.phone} passed ${tenant.max_messages_per_lead} messages without becoming hot — auto-reply stopped as a cost/safety stop, human handoff`,
@@ -583,7 +583,7 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
     // so the booking flow handles it and the AI stays active.
     if (result.needs_human && result.classification !== 'hot') {
       const reason = result.needs_human_reason || 'unspecified';
-      await db.setHumanHandoff(lead.id, true);
+      await db.setHumanHandoff(lead.id);
       clearStallTimer(leadId);
       await alertOperator(tenant, 'needs_human',
         `AI escalated ${lead.name ?? lead.phone} (reason: ${reason}) — take over the chat: https://wa.me/${lead.phone}`,

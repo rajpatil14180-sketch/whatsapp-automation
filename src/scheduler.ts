@@ -5,6 +5,30 @@ import { computeNoreplyFollowupAt, computeStalledFollowupAt, tenantTemplateBudge
 import { config } from './config';
 
 // ============================================================
+// Handoff auto-return (migration 007). This system only sends operator
+// ALERTS — it never sees the operator's replies to the student, so it
+// cannot infer "the human took over" from messages. A lead stuck in
+// human_handoff therefore auto-returns to the AI after a fixed delay UNLESS
+// handoff_hold is set. Capped to once per lead by db.getLeadsDueForHandoffReturn's
+// ai_resumed_count=0 filter — a re-escalated lead stays escalated until an
+// operator clears human_handoff by hand.
+// ============================================================
+async function sweepHandoffReturns(): Promise<void> {
+  const due = await db.getLeadsDueForHandoffReturn(config.handoffAutoReturnHours);
+  if (!due.length) return;
+  console.log(`[scheduler] ${due.length} handoff(s) due for auto-return`);
+
+  for (const lead of due) {
+    const tenant = lead.tenant;
+    await db.resumeLeadFromHandoff(lead.id);
+    console.log(`[scheduler] auto-returned ${lead.phone} to AI after ${config.handoffAutoReturnHours}h handoff`);
+    await alertOperator(tenant, 'handoff_auto_return',
+      `${lead.name ?? lead.phone} was handed off ${config.handoffAutoReturnHours}h ago and never got a reply from you — the AI has resumed the conversation. Set handoff_hold on this lead if you're actively working it and don't want this again.`,
+      lead.id, 'info');
+  }
+}
+
+// ============================================================
 // Background scheduler (P0-2). Runs inside the always-on server
 // process — this does NOT work on scale-to-zero/serverless hosting
 // (Railway keeps the process alive; see README).
@@ -22,6 +46,7 @@ let lastDigestDay = '';
 export function startScheduler(): void {
   setInterval(() => {
     sweepFollowups().catch((e) => console.error('[scheduler] sweep error', e));
+    sweepHandoffReturns().catch((e) => console.error('[scheduler] handoff-return sweep error', e));
     maybeSendDailyDigest().catch((e) => console.error('[scheduler] digest error', e));
   }, SWEEP_INTERVAL_MS);
   console.log(`[scheduler] started (sweep every ${SWEEP_INTERVAL_MS / 1000}s)`);

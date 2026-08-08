@@ -153,6 +153,13 @@ const SOUND_LIKE_A_PERSON = `HOW TO SOUND LIKE A PERSON, NOT A SCRIPT:
 // composed-prompt sections. Valid whether or not a knowledge base is actually
 // configured for this tenant: with none, "not in that section" is simply
 // always true, so the model still correctly declines to invent specifics.
+// RESUMING AFTER HANDOFF — fixed and vertical-independent, included only when
+// this lead has previously auto-returned from a human handoff (scheduler.ts
+// resumed it because the operator never replied within the configured
+// window). Not shown otherwise, so it never clutters a normal conversation.
+const RESUMING_AFTER_HANDOFF = `RESUMING AFTER HANDOFF:
+You previously escalated this lead to a human and the human did not respond, so you are taking the conversation back. Read the full history, including anything the human said. Do NOT repeat the reply that caused the earlier frustration; if the same blocker recurs, move to book or hand off — do not loop.`;
+
 const USING_WHAT_YOU_KNOW = `USING WHAT YOU KNOW:
 - The WHAT YOU KNOW section (near the end of this prompt, if present) is your only source of specific facts about countries, universities, costs, intakes and scholarships. You may state anything in it directly in chat.
 - If something is NOT in that section, do not invent it and do not state it as fact. Say honestly that you would not want to give them a number you are not certain of, and that the counsellor can confirm it.
@@ -163,7 +170,7 @@ const POSTURE_STUDENT = `OPENING POSTURE — THE STUDENT MESSAGED YOU FIRST:
 This person contacted YOU — possibly with just a greeting ("hi", "hello"), something vague, or a random question ("fees?", "Italy??"). Do NOT jump straight into qualifying questions — that feels robotic and cold. Respond FIRST as a warm, genuinely curious human: engage with whatever they actually said, the way a friendly counsellor would. You do NOT need to qualify them immediately or all at once. Let the things you care about surface NATURALLY over the course of the conversation — through real, flowing chat — not in your first message.
 If they ask a specific question, answer it lightly and honestly (always respecting the SAFETY RULES — you cannot quote fees, amounts, or promise outcomes), then gently steer back toward their plans. You keep a light hand on the wheel: never let the conversation drift into a pure Q&A help-desk where you never learn anything, but never march through a checklist or fire questions in sequence either. If they clearly just want information first, give it warmly, then try again a little later. Warm and human first; qualification emerges from the conversation, it is not done *to* them.`;
 
-function systemPrompt(tenant: Tenant, initiatedBy: 'us' | 'student'): string {
+function systemPrompt(tenant: Tenant, initiatedBy: 'us' | 'student', resumedCount = 0): string {
   const cfg = resolveConfig(tenant);
   const fieldNames = cfg.fields_to_extract.map((f) => f.split(':')[0].trim());
   const extractedSchema = cfg.extracted_schema?.trim()
@@ -179,6 +186,7 @@ function systemPrompt(tenant: Tenant, initiatedBy: 'us' | 'student'): string {
   const knowledgeBase = tenant.knowledge_base?.trim()
     ? `\nWHAT YOU KNOW (curated by this consultancy - you may state this in chat):\n${tenant.knowledge_base.trim()}\n`
     : '';
+  const resuming = resumedCount > 0 ? `\n${RESUMING_AFTER_HANDOFF}\n` : '';
 
   return `You are the first-response agent for ${tenant.business_name}, ${cfg.vertical_description}. You reply to inbound leads over WhatsApp, writing as "${tenant.agent_name}" from ${tenant.business_name}.
 
@@ -221,7 +229,7 @@ Set "needs_human": true ONLY when one of these is genuinely happening:
 - "confused" — the lead repeatedly misunderstands or is lost despite your attempts;
 - "asked_for_human" — the lead explicitly asks to talk to a person.
 Do NOT set needs_human just because the conversation is long, or because the lead is hot and progressing — a smoothly-progressing conversation NEVER needs escalation, however many messages it takes. When you do escalate, make "reply" a short warm handover (a counsellor will continue this chat personally) and set "needs_human_reason" accordingly; otherwise leave needs_human false and the reason "".
-
+${resuming}
 BLOCKER — the single primary reason this lead is NOT hot, "none" if hot (choose one): ${cfg.blocker_taxonomy.map((b) => `"${b}"`).join(' | ')}
 A blocker is only valid if the lead has actually indicated it in the conversation. If the reason this lead is not hot is simply that you have not learned enough yet, use "insufficient_information". NEVER name a specific blocker (e.g. parents_not_convinced) for something that has not been discussed — an UNKNOWN is not a BLOCKER.
 RECOMMENDED_ACTION (choose one): "book_call" | "nurture" | "chase_document" | "close"
@@ -341,7 +349,7 @@ ${mode === 'nudge' ? NUDGE_INSTRUCTION : latestSection(messages)}
 Analyse and respond with the JSON object only.`;
 
   // Old rows from before migration 002 can lack the column at runtime → default 'us'.
-  const system = systemPrompt(tenant, lead.initiated_by ?? 'us');
+  const system = systemPrompt(tenant, lead.initiated_by ?? 'us', lead.ai_resumed_count ?? 0);
   const reasoningEffort = resolveReasoningEffort();
 
   // Rough visibility into prompt growth (~4 chars/token) — logged before it

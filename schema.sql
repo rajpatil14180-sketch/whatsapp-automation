@@ -217,6 +217,20 @@ alter table tenants add column if not exists timezone text not null default 'Asi
 alter table tenants add column if not exists quiet_hours_start int not null default 21;
 alter table tenants add column if not exists quiet_hours_end int not null default 9;
 
+-- ============================================================
+-- MIGRATION 007 — handoff auto-return.
+-- Append-only: safe to run on an existing database.
+-- ============================================================
+
+-- A lead stuck in human_handoff should not stay stuck forever if the
+-- operator never engages. Since this system only sends operator ALERTS and
+-- never sees the operator's replies to the student, it cannot infer "the
+-- human took over" from messages — so a handed-off lead auto-returns to the
+-- AI after a fixed delay (scheduler.ts) UNLESS handoff_hold is set.
+alter table leads add column if not exists handoff_at timestamptz;                       -- when human_handoff was last turned ON; NULL when not in handoff
+alter table leads add column if not exists handoff_hold boolean not null default false;  -- operator actively handling this lead; AI stays out until cleared (set manually for now)
+alter table leads add column if not exists ai_resumed_count int not null default 0;      -- times the AI auto-resumed this lead (caps auto-return to once)
+
 -- ------------------------------------------------------------
 -- Example: register your first client. Fill in the real values.
 -- ------------------------------------------------------------

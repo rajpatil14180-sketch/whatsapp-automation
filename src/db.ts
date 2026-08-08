@@ -186,9 +186,14 @@ export async function markHotAlerted(leadId: string): Promise<void> {
   if (error) console.error('[db] markHotAlerted', error.message);
 }
 
-export async function setHumanHandoff(leadId: string, value: boolean): Promise<void> {
+// Centralized ON-switch for human handoff (needs_human escalation + the
+// max-messages circuit breaker are the only callers) — always pairs
+// human_handoff=true with handoff_at=now() in the SAME update so the two can
+// never drift out of sync, which the auto-return sweep depends on.
+export async function setHumanHandoff(leadId: string): Promise<void> {
+  const now = new Date().toISOString();
   const { error } = await supabase.from('leads')
-    .update({ human_handoff: value, next_followup_at: value ? null : undefined, updated_at: new Date().toISOString() })
+    .update({ human_handoff: true, handoff_at: now, next_followup_at: null, updated_at: now })
     .eq('id', leadId);
   if (error) console.error('[db] setHumanHandoff', error.message);
 }
@@ -239,6 +244,50 @@ export async function getDueFollowupLeads(): Promise<DueLead[]> {
       const track: FollowupTrack = lead.status === 'contacted' && !lead.last_inbound_at ? 'noreply' : 'stalled';
       return { ...(lead as Lead), tenant: hydrateTenant(tenant), track };
     });
+}
+
+// --- Handoff auto-return support (migration 007) ---
+
+export interface HandoffLead extends Lead {
+  tenant: Tenant;
+}
+
+// Leads stuck in human_handoff long enough to auto-return to the AI, unless
+// an operator has put an explicit hold on them (handoff_hold) or the lead
+// already used its one auto-return — ai_resumed_count=0 is what guarantees
+// "at most once" (see resumeLeadFromHandoff).
+export async function getLeadsDueForHandoffReturn(hours: number): Promise<HandoffLead[]> {
+  const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('leads')
+    .select('*, tenant:tenants(*)')
+    .eq('human_handoff', true)
+    .eq('handoff_hold', false)
+    .eq('ai_resumed_count', 0)
+    .not('handoff_at', 'is', null)
+    .lt('handoff_at', cutoff)
+    .limit(100);
+  if (error) { console.error('[db] getLeadsDueForHandoffReturn', error.message); return []; }
+  return (data ?? [])
+    .filter((row: any) => row.tenant)
+    .map((row: any) => {
+      const { tenant, ...lead } = row;
+      return { ...(lead as Lead), tenant: hydrateTenant(tenant) };
+    });
+}
+
+// The AI takes the conversation back: human_handoff off, handoff_at cleared,
+// ai_resumed_count incremented — the increment is what the ai_resumed_count=0
+// filter above uses to guarantee this never fires twice for the same lead.
+// (No separate needs_human column exists on leads to clear — that flag lives
+// only on the brain's per-turn BrainResult, not persisted state.)
+export async function resumeLeadFromHandoff(leadId: string): Promise<void> {
+  const lead = await getLeadById(leadId);
+  const nextCount = (lead?.ai_resumed_count ?? 0) + 1;
+  const { error } = await supabase.from('leads')
+    .update({ human_handoff: false, handoff_at: null, ai_resumed_count: nextCount, updated_at: new Date().toISOString() })
+    .eq('id', leadId);
+  if (error) console.error('[db] resumeLeadFromHandoff', error.message);
 }
 
 // Lightweight claim so a slow sweep never double-sends (P0-2).
