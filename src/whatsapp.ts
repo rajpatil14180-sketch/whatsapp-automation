@@ -62,6 +62,33 @@ export async function sendText(tenant: Tenant, to: string, text: string): Promis
   return send(tenant, payload);
 }
 
+// Typing indicator — delivered as part of marking the inbound message read
+// (same endpoint/auth/payload shape as sendText, different body). Shows for
+// up to ~25s or until our next outbound message, whichever comes first; there
+// is no separate "stop typing" call. Never throws: any failure is logged and
+// swallowed so it can never block or delay the actual reply.
+export async function markReadWithTyping(tenant: Tenant, messageId: string): Promise<void> {
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      status: 'read',
+      message_id: messageId,
+      typing_indicator: { type: 'text' },
+    };
+    const res = await fetch(`${GRAPH}/${tenant.wa_phone_number_id}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tenant.wa_token}` },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
+      console.warn('[whatsapp] typing indicator failed', JSON.stringify(json));
+    }
+  } catch (e) {
+    console.warn('[whatsapp] typing indicator failed', e);
+  }
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Retries on network errors and HTTP 5xx (1s then 3s). 4xx client errors

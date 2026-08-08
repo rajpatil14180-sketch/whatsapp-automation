@@ -6,6 +6,10 @@ export const config = {
   // App secret for verifying webhook signatures. If empty, signature checks are skipped (dev only).
   metaAppSecret: process.env.META_APP_SECRET || '',
   graphVersion: process.env.GRAPH_VERSION || 'v21.0',
+  // WhatsApp "typing…" indicator while the brain composes a reply. On by
+  // default; requires Graph API v25.0+ (see README) — set to false to
+  // disable per-deploy if the configured GRAPH_VERSION doesn't support it.
+  typingIndicator: (process.env.WHATSAPP_TYPING_INDICATOR ?? 'true') !== 'false',
 
   supabaseUrl: process.env.SUPABASE_URL || '',
   supabaseKey: process.env.SUPABASE_SERVICE_KEY || '',

@@ -231,6 +231,7 @@ export function debounceForText(text: string): number {
 interface PendingEntry {
   timer: NodeJS.Timeout;
   texts: string[];
+  lastInboundWaId?: string; // most recent inbound wamid — used to fire the typing indicator
 }
 const pendingTurns = new Map<string, PendingEntry>();
 
@@ -399,6 +400,7 @@ export async function handleInboundMessage(
   // Debounce: (re)start the quiet-period timer for this lead.
   const entry = pendingTurns.get(lead.id) ?? { timer: setTimeout(() => {}, 0), texts: [] };
   entry.texts.push(text);
+  entry.lastInboundWaId = waMessageId;
   scheduleTurn(tenant, lead.id, entry);
   pendingTurns.set(lead.id, entry);
 }
@@ -470,6 +472,13 @@ async function processLeadTurn(tenant: Tenant, leadId: string): Promise<void> {
 
     const history = await db.getConversation(lead.id);
     const prior = history.slice(0, Math.max(0, history.length - entry.texts.length));
+
+    // Show the WhatsApp "typing…" indicator (and mark the lead's message read)
+    // while the brain composes. Fire-and-forget so it never delays the reply;
+    // it clears itself after ~25s or when the reply is sent.
+    if (config.typingIndicator && entry.lastInboundWaId) {
+      void wa.markReadWithTyping(tenant, entry.lastInboundWaId);
+    }
 
     // Fix 3: pass the individual fragments, not a joined string — runBrain
     // frames >1 message explicitly as "N messages, answer all of them" so a
